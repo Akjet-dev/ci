@@ -46,7 +46,7 @@ jobs:
 
     steps:
       - name: Connect to NetBird
-        uses: Akjet-dev/ci/netbird@v1
+        uses: Akjet-dev/ci/netbird@main
         with:
           setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
           management-url: ${{ secrets.NETBIRD_MANAGEMENT_URL }}

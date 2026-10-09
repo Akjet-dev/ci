@@ -7,7 +7,7 @@
 Ставит NetBird нужной версии, подключается и ждёт маршрут до хоста.
 
 ```yaml
-- uses: Akjet-dev/ci/netbird@v1
+- uses: Akjet-dev/ci/netbird@main
   with:
     setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
     management-url: ${{ secrets.NETBIRD_MANAGEMENT_URL }}
@@ -26,7 +26,7 @@ NetBird → SSH → `git fetch` + `reset --hard` на ветку пуша → `.
 ```yaml
 jobs:
   deploy:
-    uses: Akjet-dev/ci/.github/workflows/deploy.yml@v1
+    uses: Akjet-dev/ci/.github/workflows/deploy.yml@main
     with:
       repo: Akjet-dev/backend
       # target: akjet   # уходит в bin/deploy как DEPLOY_TARGET
@@ -42,8 +42,4 @@ jobs:
 
 ## Версии
 
-Workflow ссылается на action как `Akjet-dev/ci/netbird@v1`, поэтому тег `v1` должен указывать на коммит, где есть обе части. После изменений:
-
-```bash
-git tag -f v1 && git push -f origin v1
-```
+Проекты и сам workflow ссылаются на `@main`: любой пуш в `main` этого репозитория сразу применяется ко всем деплоям. Изменения лучше проверять в ветке, временно указав её в одном проекте вместо `@main`.
