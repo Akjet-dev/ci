@@ -1,0 +1,113 @@
+name: Deploy over NetBird
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: GitHub repository checked out on the server, e.g. Akjet-dev/backend
+        type: string
+        required: true
+      target:
+        description: Optional deploy target (e.g. brand), passed to bin/deploy as DEPLOY_TARGET
+        type: string
+        default: ''
+      host:
+        description: Server address inside the NetBird network
+        type: string
+        default: '10.128.0.5'
+      port:
+        description: SSH port
+        type: number
+        default: 22
+      netbird-version:
+        type: string
+        default: '0.78.1'
+    secrets:
+      NETBIRD_SETUP_KEY:
+        required: true
+      NETBIRD_MANAGEMENT_URL:
+        required: true
+      DEPLOY_USER:
+        required: true
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_PATH:
+        description: Absolute path of the checkout on the server
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.target || github.ref_name }}
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ github.ref_name }}-${{ inputs.target }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Connect to NetBird
+        uses: Akjet-dev/ci/netbird@v1
+        with:
+          setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
+          management-url: ${{ secrets.NETBIRD_MANAGEMENT_URL }}
+          version: ${{ inputs.netbird-version }}
+          wait-for-ip: ${{ inputs.host }}
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_REPO: ${{ inputs.repo }}
+          DEPLOY_BRANCH: ${{ github.ref_name }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_TARGET: ${{ inputs.target }}
+        with:
+          host: ${{ inputs.host }}
+          port: ${{ inputs.port }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: DEPLOY_REPO,DEPLOY_BRANCH,DEPLOY_PATH,DEPLOY_TARGET
+          script: |
+            bash <<'EOS'
+            set -euo pipefail
+
+            if [ -z "${DEPLOY_PATH:-}" ]; then
+              echo "Deploy path is empty for branch ${DEPLOY_BRANCH}"
+              exit 1
+            fi
+
+            echo "Deploying ${DEPLOY_REPO}@${DEPLOY_BRANCH} ${DEPLOY_TARGET:+(target: ${DEPLOY_TARGET}) }-> ${DEPLOY_PATH}"
+            cd "${DEPLOY_PATH}"
+
+            TOKEN="$(/usr/local/bin/generate-github-token.sh)"
+
+            if [ -z "$TOKEN" ]; then
+              echo "TOKEN is empty"
+              exit 1
+            fi
+
+            # Never leave the token in .git/config, even if fetch fails
+            trap 'git remote set-url origin "https://github.com/${DEPLOY_REPO}.git"' EXIT
+
+            git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${DEPLOY_REPO}.git"
+            git fetch origin "${DEPLOY_BRANCH}"
+            git remote set-url origin "https://github.com/${DEPLOY_REPO}.git"
+
+            git checkout -B "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}"
+            git reset --hard "origin/${DEPLOY_BRANCH}"
+
+            if [ ! -e ./bin/deploy ]; then
+              echo "No ./bin/deploy, code update only"
+              exit 0
+            fi
+
+            if [ ! -x ./bin/deploy ]; then
+              echo "./bin/deploy is not executable"
+              exit 1
+            fi
+
+            ./bin/deploy
+            EOS
+
+      - name: Disconnect NetBird
+        if: always()
+        run: sudo netbird down || true

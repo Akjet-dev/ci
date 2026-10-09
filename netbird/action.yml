@@ -1,0 +1,97 @@
+name: Connect to NetBird
+description: Install a pinned NetBird version, connect to the network and wait for a route to the target host
+
+inputs:
+  setup-key:
+    description: NetBird setup key
+    required: true
+  management-url:
+    description: NetBird management URL
+    required: true
+  version:
+    description: NetBird package version to install
+    default: '0.78.1'
+  wait-for-ip:
+    description: IP address that must be routed through the NetBird interface before continuing
+    required: true
+  wait-attempts:
+    description: How many times to check the route (5 seconds apart)
+    default: '18'
+
+runs:
+  using: composite
+  steps:
+    - name: Install NetBird ${{ inputs.version }}
+      shell: bash
+      env:
+        NB_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        curl -fsSL https://pkgs.netbird.io/install.sh | sudo bash
+
+        PACKAGE_VERSION="$(apt-cache madison netbird \
+          | awk -v v="$NB_VERSION" 'index($3, v) == 1 {print $3; exit}')"
+
+        if [ -z "$PACKAGE_VERSION" ]; then
+          echo "NetBird ${NB_VERSION} package not found"
+          exit 1
+        fi
+
+        sudo netbird down || true
+        sudo systemctl stop netbird || true
+
+        sudo apt-get install -y \
+          --allow-downgrades \
+          "netbird=$PACKAGE_VERSION"
+
+        sudo systemctl restart netbird
+
+        netbird version
+
+    - name: Disable NetBird lazy connections
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        sudo netbird service reconfigure \
+          --service-env NB_LAZY_CONN=off
+
+        sudo systemctl restart netbird
+        sleep 2
+
+    - name: Connect to NetBird
+      shell: bash
+      env:
+        NB_SETUP_KEY: ${{ inputs.setup-key }}
+        NB_MANAGEMENT_URL: ${{ inputs.management-url }}
+      run: |
+        set -euo pipefail
+
+        sudo netbird up \
+          --setup-key "$NB_SETUP_KEY" \
+          --management-url "$NB_MANAGEMENT_URL"
+
+    - name: Wait for route to ${{ inputs.wait-for-ip }}
+      shell: bash
+      env:
+        TARGET_IP: ${{ inputs.wait-for-ip }}
+        ATTEMPTS: ${{ inputs.wait-attempts }}
+      run: |
+        set -euo pipefail
+
+        for i in $(seq 1 "$ATTEMPTS"); do
+          if ip route get "$TARGET_IP" 2>/dev/null | grep -q 'dev wt0'; then
+            echo "NetBird route to ${TARGET_IP} is ready"
+            ip route get "$TARGET_IP"
+            exit 0
+          fi
+
+          echo "Waiting for NetBird route... $i/$ATTEMPTS"
+          sleep 5
+        done
+
+        echo "NetBird route to ${TARGET_IP} was not installed"
+        sudo netbird status -dA || true
+        sudo netbird networks list || true
+        exit 1
