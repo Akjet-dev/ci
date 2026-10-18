@@ -69,6 +69,8 @@ mv production production.bak && ln -sfn current production
 
 На сервере нужны `rsync` и GNU coreutils (`mv -T`); `DEPLOY_USER` должен иметь права записи в `DEPLOY_PATH`.
 
+TODO: закрепить host key сервера (сейчас `rsync` подключается с `StrictHostKeyChecking=accept-new`).
+
 ### `@main` / `@v1` — сборка на сервере (устарело)
 
 > **Deprecated.** Сборка на сервере перегружает CPU/RAM хоста. Новые проекты подключайте через `@v2`. `@main` и `@v1` пока сохраняют это поведение; ссылающимся на `@main` лучше закрепиться на `@v1`.

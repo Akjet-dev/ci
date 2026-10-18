@@ -79,7 +79,8 @@ jobs:
           du -sh dist
 
       - name: Connect to NetBird
-        uses: Akjet-dev/ci/netbird@main
+        # Pinned to a commit so v2 has no floating dependencies (netbird/ as of 7685679)
+        uses: Akjet-dev/ci/netbird@7685679c81e7f7424bd7f1a8e4b8ef10ce0bc0ec
         with:
           setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
           management-url: ${{ secrets.NETBIRD_MANAGEMENT_URL }}
