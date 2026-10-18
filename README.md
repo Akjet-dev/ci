@@ -21,14 +21,66 @@
 
 ## `.github/workflows/deploy.yml` — reusable workflow
 
-> **Deprecated.** Описанный ниже вариант собирает проект на сервере и перегружает его CPU/RAM. Используйте `@v2`: сборка идёт на раннере, на сервер приезжает готовый артефакт (`rsync` → `releases/<sha>` → атомарное переключение `current`). Документация и миграция — в README тега [`v2`](https://github.com/Akjet-dev/ci/blob/v2/README.md). `@main` и `@v1` пока сохраняют старое поведение; ссылающимся на `@main` лучше закрепиться на `@v1`.
+### `@v2` — деплой готового артефакта (рекомендуется)
+
+Сборка идёт на раннере GitHub Actions. На сервере не запускаются `git`, установка зависимостей и сборка — только приём файлов и переключение симлинка.
+
+Download artifact → NetBird → SSH → `rsync` в `releases/<sha>.partial` → `releases/<sha>` → атомарное переключение `current` → удаление старых релизов (остаются последние `keep-releases`, по умолчанию 3) → отключение NetBird.
+
+```yaml
+jobs:
+  build:
+    # ... собрать и загрузить: actions/upload-artifact@v4 с name: build-akjet-main
+  deploy:
+    needs: build
+    uses: Akjet-dev/ci/.github/workflows/deploy.yml@v2
+    with:
+      artifact: build-akjet-main   # артефакт из этого же запуска workflow
+      target: akjet                # только для имени job/concurrency
+    secrets:
+      NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
+      NETBIRD_MANAGEMENT_URL: ${{ secrets.NETBIRD_MANAGEMENT_URL }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_PATH: ${{ secrets.MAIN_DEPLOY_PATH }}
+```
+
+Структура на сервере (`DEPLOY_PATH`):
+
+```
+releases/<sha>/            по каталогу на коммит
+current -> releases/<sha>
+production -> current      корень веб-сервера
+```
+
+Однократная миграция существующего каталога (до первого деплоя через `@v2`):
+
+```bash
+cd "$DEPLOY_PATH"
+mkdir -p releases
+cp -a production releases/pre-v2        # текущая версия становится первым релизом
+ln -sfn releases/pre-v2 current
+mv production production.bak && ln -sfn current production
+```
+
+Пока `production` — обычный каталог, деплой `@v2` завершается с ошибкой и ничего не меняет.
+
+Откат: `ln -sfn releases/<sha> current.tmp && mv -Tf current.tmp current`.
+
+На сервере нужны `rsync` и GNU coreutils (`mv -T`); `DEPLOY_USER` должен иметь права записи в `DEPLOY_PATH`.
+
+TODO: закрепить host key сервера (сейчас `rsync` подключается с `StrictHostKeyChecking=accept-new`).
+
+### `@main` / `@v1` — сборка на сервере (устарело)
+
+> **Deprecated.** Сборка на сервере перегружает CPU/RAM хоста. Новые проекты подключайте через `@v2`. `@main` и `@v1` пока сохраняют это поведение; ссылающимся на `@main` лучше закрепиться на `@v1`.
 
 NetBird → SSH → `git fetch` + `reset --hard` на ветку пуша → `./bin/deploy` (если он есть в проекте) → отключение NetBird.
 
 ```yaml
 jobs:
   deploy:
-    uses: Akjet-dev/ci/.github/workflows/deploy.yml@main
+    uses: Akjet-dev/ci/.github/workflows/deploy.yml@v1
     with:
       repo: Akjet-dev/backend
       # target: akjet   # уходит в bin/deploy как DEPLOY_TARGET
@@ -44,4 +96,6 @@ jobs:
 
 ## Версии
 
-Проекты и сам workflow ссылаются на `@main`: любой пуш в `main` этого репозитория сразу применяется ко всем деплоям. Изменения лучше проверять в ветке, временно указав её в одном проекте вместо `@main`.
+- `v2` — деплой артефакта, сборка на раннере.
+- `v1` — сборка на сервере (устарело).
+- `main` — ветка разработки; закрепляйтесь на тег, а не на `@main`. Изменения проверяйте в ветке, временно указав её в одном проекте.
