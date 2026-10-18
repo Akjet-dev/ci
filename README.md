@@ -21,6 +21,8 @@
 
 ## `.github/workflows/deploy.yml` — reusable workflow
 
+> **Deprecated.** Описанный ниже вариант собирает проект на сервере и перегружает его CPU/RAM. Используйте `@v2`: сборка идёт на раннере, на сервер приезжает готовый артефакт (`rsync` → `releases/<sha>` → атомарное переключение `current`). Документация и миграция — в README тега [`v2`](https://github.com/Akjet-dev/ci/blob/v2/README.md). `@main` и `@v1` пока сохраняют старое поведение; ссылающимся на `@main` лучше закрепиться на `@v1`.
+
 NetBird → SSH → `git fetch` + `reset --hard` на ветку пуша → `./bin/deploy` (если он есть в проекте) → отключение NetBird.
 
 ```yaml
