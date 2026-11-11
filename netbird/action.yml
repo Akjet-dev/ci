@@ -1,5 +1,6 @@
+
 name: Connect to NetBird
-description: Install a pinned NetBird version, connect to the network and wait for a route to the target host
+description: Install NetBird, connect to the network and wait for a route to the target host
 
 inputs:
   setup-key:
@@ -8,9 +9,6 @@ inputs:
   management-url:
     description: NetBird management URL
     required: true
-  version:
-    description: NetBird package version to install
-    default: '0.78.1'
   wait-for-ip:
     description: IP address that must be routed through the NetBird interface before continuing
     required: true
@@ -21,33 +19,12 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Install NetBird ${{ inputs.version }}
+    - name: Install NetBird
       shell: bash
-      env:
-        NB_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
 
         curl -fsSL https://pkgs.netbird.io/install.sh | sudo bash
-
-        PACKAGE_VERSION="$(apt-cache madison netbird \
-          | awk -v v="$NB_VERSION" 'index($3, v) == 1 {print $3; exit}')"
-
-        if [ -z "$PACKAGE_VERSION" ]; then
-          echo "NetBird ${NB_VERSION} package not found"
-          exit 1
-        fi
-
-        sudo netbird down || true
-        sudo systemctl stop netbird || true
-
-        sudo apt-get install -y \
-          --allow-downgrades \
-          "netbird=$PACKAGE_VERSION"
-
-        sudo systemctl restart netbird
-
-        netbird version
 
     - name: Disable NetBird lazy connections
       shell: bash
