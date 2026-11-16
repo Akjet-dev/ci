@@ -1,0 +1,17 @@
+# expect: hostnames
+image:
+  repository: ghcr.io/example-org/example-api
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+components:
+  web:
+    ports: { http: 8080 }
+    service: { enabled: true }
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+httpRoute:
+  enabled: true
+  parentRef: { name: example-gateway, namespace: example-gateways }
+  routes:
+    - component: web
+      hostnames: []

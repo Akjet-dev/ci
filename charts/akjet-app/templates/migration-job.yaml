@@ -1,0 +1,68 @@
+{{- /*
+Rendered ONLY on request (migration.render=true): the Job is created by the deploy workflow before
+`helm upgrade`, so it must not depend on objects of the release (ConfigMap, ServiceAccount) that may not
+exist yet or may still belong to the previous revision. Non-secret configuration is therefore inlined;
+Secrets are referenced by name. It is never part of the Helm release and is not a Helm hook.
+*/ -}}
+{{- if and .Values.migration.enabled .Values.migration.render }}
+{{- $m := .Values.migration }}
+{{- $plain := merge (dict) ($m.config | default dict) (.Values.config | default dict) }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-migrate-%s" (include "akjet-app.fullname" .) (required "migration.runId is required when migration.render is true" $m.runId) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "akjet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  activeDeadlineSeconds: {{ $m.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ $m.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "akjet-app.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      securityContext:
+        {{- include "akjet-app.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: migration
+          image: {{ include "akjet-app.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: {{ toJson $m.command }}
+          {{- with $m.args }}
+          args: {{ toJson . }}
+          {{- end }}
+          securityContext:
+            {{- include "akjet-app.containerSecurityContext" . | nindent 12 }}
+          {{- with include "akjet-app.envFrom" (dict "root" . "scope" $m "configMap" false) }}
+          envFrom:
+            {{- . | nindent 12 }}
+          {{- end }}
+          {{- with include "akjet-app.env" (dict "root" . "plain" $plain "scope" $m) }}
+          env:
+            {{- . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml $m.resources | nindent 12 }}
+          {{- with include "akjet-app.volumeMounts" (dict "root" . "paths" $m.writablePaths) }}
+          volumeMounts:
+            {{- . | nindent 12 }}
+          {{- end }}
+      {{- with include "akjet-app.volumes" (dict "root" . "paths" $m.writablePaths) }}
+      volumes:
+        {{- . | nindent 8 }}
+      {{- end }}
+{{- end }}

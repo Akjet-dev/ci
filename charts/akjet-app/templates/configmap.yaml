@@ -1,0 +1,13 @@
+{{- include "akjet-app.validate" . -}}
+{{- if .Values.config }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "akjet-app.fullname" . }}-config
+  labels:
+    {{- include "akjet-app.labels" . | nindent 4 }}
+data:
+  {{- range $name := keys .Values.config | sortAlpha }}
+  {{ $name }}: {{ get $.Values.config $name | toString | quote }}
+  {{- end }}
+{{- end }}

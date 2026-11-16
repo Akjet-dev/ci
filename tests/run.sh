@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# Offline test suite of the shared chart and the reusable workflows. Nothing here talks to a cluster,
+# a registry or GitHub.
+#
+#   tests/run.sh
+#
+# Tools (override with environment variables): HELM, KUBECONFORM, ACTIONLINT, yq, python3.
+# KUBERNETES_VERSION   schema version for kubeconform (default 1.35.6)
+# SCHEMA_DIR           optional directory with offline schemas:
+#                        $SCHEMA_DIR/k8s/<kind>-<group>-<version>.json   (standalone-strict layout)
+#                        $SCHEMA_DIR/gateway.networking.k8s.io/<kind>_<version>.json
+#                      without it kubeconform downloads the public schemas.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+HELM="${HELM:-helm}"
+KUBECONFORM="${KUBECONFORM:-kubeconform}"
+ACTIONLINT="${ACTIONLINT:-actionlint}"
+KUBERNETES_VERSION="${KUBERNETES_VERSION:-1.35.6}"
+CHART=charts/akjet-app
+RELEASE=example
+NAMESPACE=dev-example
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/akjet-ci.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+fails=0
+pass() { echo "ok    $1"; }
+fail() { echo "FAIL  $1"; fails=$((fails + 1)); }
+
+if [ -n "${SCHEMA_DIR:-}" ]; then
+  schema_args=(
+    -schema-location "${SCHEMA_DIR}/k8s/{{ .ResourceKind }}{{ .KindSuffix }}.json"
+    -schema-location "${SCHEMA_DIR}/{{ .Group }}/{{ .ResourceKind }}_{{ .ResourceAPIVersion }}.json"
+  )
+else
+  schema_args=(
+    -schema-location default
+    -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+  )
+fi
+
+render() { "$HELM" template "$RELEASE" "$CHART" --namespace "$NAMESPACE" "$@"; }
+
+echo "== tools"
+"$HELM" version --short
+"$KUBECONFORM" -v
+"$ACTIONLINT" -version | head -1
+
+echo "== valid fixtures: lint, render, schema validation, security checks"
+for values in "$CHART"/ci/*-values.yaml; do
+  name="$(basename "$values" -values.yaml)"
+  out="$WORK/$name.yaml"
+  if "$HELM" lint "$CHART" --strict -f "$values" >"$WORK/lint.log" 2>&1; then
+    pass "$name: helm lint --strict"
+  else
+    fail "$name: helm lint --strict"; cat "$WORK/lint.log"
+  fi
+  if ! render -f "$values" >"$out" 2>"$WORK/render.log"; then
+    fail "$name: helm template"; cat "$WORK/render.log"; continue
+  fi
+  pass "$name: helm template"
+  if "$KUBECONFORM" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" "${schema_args[@]}" "$out" >"$WORK/kubeconform.log" 2>&1; then
+    pass "$name: kubeconform -strict ($(tail -1 "$WORK/kubeconform.log"))"
+  else
+    fail "$name: kubeconform -strict"; cat "$WORK/kubeconform.log"
+  fi
+  if yq ea -o=json '[.]' "$out" | python3 tests/policy_check.py --name "$name" >"$WORK/policy.log" 2>&1; then
+    pass "$name: $(cat "$WORK/policy.log")"
+  else
+    fail "$name: security checks"; cat "$WORK/policy.log"
+  fi
+  # No secret material: the chart never renders a Secret object or a literal credential.
+  if grep -Eq '^kind: Secret$' "$out"; then fail "$name: a Secret object was rendered"; fi
+done
+
+echo "== behaviour"
+expect_kinds() {  # label, expected sorted "Kind/name" list, helm args...
+  local label="$1" expected="$2"; shift 2
+  local got
+  got="$(render "$@" | yq ea -N '[.kind + "/" + .metadata.name] | .[]' - | sort | tr '\n' ' ' | sed 's/ $//')"
+  if [ "$got" = "$expected" ]; then pass "$label"; else fail "$label: got '$got', expected '$expected'"; fi
+}
+expect_kinds "static frontend renders exactly ServiceAccount, Deployment, Service" \
+  "Deployment/example-web Service/example-web ServiceAccount/example" \
+  -f "$CHART/ci/01-static-frontend-values.yaml"
+expect_kinds "HTTPRoute is not rendered unless httpRoute.enabled" \
+  "Deployment/example-web Service/example-web ServiceAccount/example" \
+  -f "$CHART/ci/06-httproute-values.yaml" --set httpRoute.enabled=false
+expect_kinds "worker and scheduler get no Service" \
+  "ConfigMap/example-config Deployment/example-scheduler Deployment/example-web Deployment/example-worker Service/example-web ServiceAccount/example" \
+  -f "$CHART/ci/03-laravel-web-worker-scheduler-values.yaml"
+expect_kinds "migration Job is not part of a normal release (render=false)" \
+  "ConfigMap/example-config Deployment/example-web Service/example-web ServiceAccount/example" \
+  -f "$CHART/ci/04-migration-job-values.yaml" --set migration.render=false
+expect_kinds "migration Job can be rendered alone" \
+  "Job/example-migrate-42-1" \
+  -f "$CHART/ci/04-migration-job-values.yaml" --set-string migration.runId=42-1 --show-only templates/migration-job.yaml
+
+job="$(render -f "$CHART/ci/04-migration-job-values.yaml" --show-only templates/migration-job.yaml)"
+if [ "$(echo "$job" | yq '.spec.template.spec.containers[0].env[] | select(.name == "DB_USERNAME") | .value')" = "example_dev_migrator" ]; then
+  pass "migration.config overrides the release config (migrator role)"
+else
+  fail "migration.config does not override the release config"
+fi
+if [ "$(echo "$job" | yq '[.spec.template.spec.containers[0].envFrom[].secretRef.name] | join(",")')" = "example-app,example-migrate" ]; then
+  pass "migration Job references Secrets by name, migration-specific last"
+else
+  fail "migration Job Secret references"
+fi
+
+sched="$(render -f "$CHART/ci/03-laravel-web-worker-scheduler-values.yaml" | yq 'select(.kind == "Deployment" and .metadata.name == "example-scheduler")')"
+if [ "$(echo "$sched" | yq '.spec.strategy.type')" = "Recreate" ] && [ "$(echo "$sched" | yq '.spec.replicas')" = "1" ]; then
+  pass "scheduler uses Recreate with one replica"
+else
+  fail "scheduler strategy"
+fi
+
+a="$(render -f "$CHART/ci/02-laravel-api-values.yaml" | yq 'select(.kind == "Deployment") | .spec.template.metadata.annotations."checksum/config"')"
+b="$(render -f "$CHART/ci/02-laravel-api-values.yaml" --set-string config.NEW_FEATURE_FLAG=on | yq 'select(.kind == "Deployment") | .spec.template.metadata.annotations."checksum/config"')"
+if [ -n "$a" ] && [ "$a" != "$b" ]; then
+  pass "a new variable needs only values (and rolls the pods: config checksum changes)"
+else
+  fail "config checksum does not change with config"
+fi
+
+c="$(render -f "$CHART/ci/02-laravel-api-values.yaml" --set-string rolloutRevision=run-1 | yq 'select(.kind == "Deployment") | .spec.template.metadata.annotations."akjet.kz/rollout-revision"')"
+if [ "$c" = "run-1" ]; then pass "rolloutRevision restarts pods without an image change"; else fail "rolloutRevision annotation"; fi
+
+echo "== invalid fixtures must be rejected"
+for values in tests/invalid/*.yaml; do
+  name="$(basename "$values" .yaml)"
+  expected="$(sed -n 's/^# expect: //p' "$values" | head -1)"
+  if render -f "$values" >/dev/null 2>"$WORK/invalid.log"; then
+    fail "$name: was accepted"
+  elif grep -qF -- "$expected" "$WORK/invalid.log"; then
+    pass "$name: rejected ($expected)"
+  else
+    fail "$name: rejected for another reason than '$expected'"; cat "$WORK/invalid.log"
+  fi
+done
+
+echo "== workflows"
+templates=(examples/service-repo/.github/workflows/k8s-build.yml examples/service-repo/.github/workflows/k8s-deploy.yml)
+if "$ACTIONLINT" -color=false .github/workflows/*.yml "${templates[@]}" >"$WORK/actionlint.log" 2>&1; then
+  pass "actionlint: $(find .github/workflows -name '*.yml' | wc -l | tr -d ' ') workflow files and ${#templates[@]} templates"
+else
+  fail "actionlint"; cat "$WORK/actionlint.log"
+fi
+new_workflows=(.github/workflows/build-image.yml .github/workflows/deploy-k8s.yml .github/workflows/chart-ci.yml)
+if grep -nE 'uses: +[^ ]+@' "${new_workflows[@]}" | grep -vE '@[0-9a-f]{40}( |$)' >"$WORK/pins.log"; then
+  fail "actions must be pinned to a full commit SHA"; cat "$WORK/pins.log"
+else
+  pass "every action is pinned to a full commit SHA"
+fi
+if grep -nE 'secrets: *inherit|pull_request_target' "${new_workflows[@]}" "${templates[@]}" >"$WORK/wf.log"; then
+  fail "secrets: inherit / pull_request_target are not allowed"; cat "$WORK/wf.log"
+else
+  pass "no 'secrets: inherit', no pull_request_target"
+fi
+if [ "$(cat "${new_workflows[@]}" | grep -cE '^permissions:')" = "${#new_workflows[@]}" ]; then
+  pass "every new workflow declares top-level permissions"
+else
+  fail "top-level permissions missing in a workflow"
+fi
+
+echo "== deploy-k8s.yml: what can be deployed, and from where"
+dk=.github/workflows/deploy-k8s.yml
+if grep -niE '(^|[^a-z])(prod|production)([^a-z]|$)' "$dk" "${templates[@]}" .github/workflows/build-image.yml >"$WORK/env.log"; then
+  fail "the Kubernetes workflows must not mention production"; cat "$WORK/env.log"
+else
+  pass "no production target anywhere in the Kubernetes workflows and templates"
+fi
+inputs="$(yq '.on.workflow_call.inputs | keys | join(" ")' "$dk")"
+case " $inputs " in
+  *" namespace "*|*runner*|*" branch "*|*" service "*|*" kubeconfig "*|*" cluster "*) fail "deploy-k8s.yml exposes an input that selects the target: $inputs" ;;
+  *) pass "no input selects the namespace, the runner, the cluster or the deployment branch ($inputs)" ;;
+esac
+if [ "$(yq '.on.workflow_call.secrets // {} | length' "$dk")" = "0" ]; then
+  pass "deploy-k8s.yml accepts no secrets"
+else
+  fail "deploy-k8s.yml must not accept secrets"
+fi
+deploy_if="$(yq '.jobs.deploy.if' "$dk" | tr '\n' ' ')"
+ok_if=true
+for guard in "needs.validate.outputs.deploy == 'true'" "!inputs.validate-only" "inputs.environment == 'dev'" \
+             "github.ref == 'refs/heads/dev-k8s/release'" "vars.K8S_DEV_DEPLOY_ENABLED == 'true'"; do
+  case "$deploy_if" in *"$guard"*) ;; *) ok_if=false; echo "      missing in jobs.deploy.if: $guard" ;; esac
+done
+case "$deploy_if" in *"||"*) ok_if=false ;; esac
+if $ok_if; then pass "the deploy job is guarded by environment, branch, validate-only and the repository switch (AND only)"; else fail "deploy job guard"; fi
+if [ "$(yq '.jobs.deploy.env.ENVIRONMENT' "$dk")" = "dev" ] && [ "$(yq '.jobs.deploy.env.HELM_DRIVER' "$dk")" = "configmap" ]; then
+  pass "the deploy job is hard-wired to dev and stores releases in ConfigMaps"
+else
+  fail "deploy job environment / HELM_DRIVER"
+fi
+if yq '.jobs.validate.steps[].run // ""' "$dk" | grep -qE 'kubectl|helm (upgrade|install|rollback|uninstall)'; then
+  fail "the validate job must not touch a cluster"
+else
+  pass "the validate job (GitHub-hosted) never calls kubectl or a mutating helm command"
+fi
+
+resolve="$(yq '.jobs.validate.steps[0].run' "$dk")"
+runner_label="$(yq '.env.RUNNER_LABEL' "$dk")"
+deploy_branch="$(yq '.env.DEV_DEPLOY_BRANCH' "$dk")"
+if [ "$runner_label" = "akjet-ds-apps" ] && [ "$deploy_branch" = "dev-k8s/release" ]; then
+  pass "fixed contract: shared runner akjet-ds-apps, DEV deployment branch dev-k8s/release"
+else
+  fail "fixed contract: RUNNER_LABEL='$runner_label' DEV_DEPLOY_BRANCH='$deploy_branch'"
+fi
+# shellcheck disable=SC2016  # the GitHub expression is compared literally
+if [ "$(yq '.jobs.deploy.runs-on' "$dk")" = '${{ needs.validate.outputs.runner }}' ] \
+   && ! grep -q 'RUNNER_PREFIX' "$dk"; then
+  pass "the deploy job runs on the runner resolved from RUNNER_LABEL; no per-service runner derivation"
+else
+  fail "deploy job runs-on / per-service runner derivation"
+fi
+kinds_case="$(yq '.jobs.validate.steps[] | select(.name == "Validate manifests") | .run' "$dk" | grep -E '^ *ConfigMap\|' | tr -d ' ')"
+if [ "$kinds_case" = "ConfigMap|ServiceAccount|Deployment|Service|Job);;" ]; then
+  pass "an application release may render only ConfigMap, ServiceAccount, Deployment, Service, Job (no HTTPRoute)"
+else
+  fail "allowed kinds in deploy-k8s.yml: '$kinds_case'"
+fi
+good_digest="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# environment ref event validate-only [digest] [release] [values-dir] [chart] [repository] [chart-version]
+run_resolve() {
+  : >"$WORK/gh_output"
+  local repo="${9:-Example-Org/example-api}"
+  env -i PATH="$PATH" GITHUB_OUTPUT="$WORK/gh_output" GITHUB_REPOSITORY="$repo" GITHUB_REPOSITORY_OWNER="${repo%%/*}" \
+    RUNNER_LABEL="$runner_label" DEV_DEPLOY_BRANCH="$deploy_branch" \
+    ENVIRONMENT="$1" GITHUB_REF="$2" GITHUB_EVENT_NAME="$3" VALIDATE_ONLY="$4" DIGEST="${5-$good_digest}" \
+    RELEASE_INPUT="${6:-}" VALUES_DIR="${7:-deploy}" CHART_INPUT="${8:-}" CHART_VERSION="${10:-1.2.3}" \
+    TIMEOUT="10m" DEPLOY_ENABLED="true" bash -c "$resolve" >"$WORK/resolve.log" 2>&1
+}
+out() { grep -qx "$1" "$WORK/gh_output"; }
+accept() {  # label, expected output line, args...
+  local label="$1" line="$2"; shift 2
+  if run_resolve "$@" && out "$line"; then pass "$label"; else fail "$label"; cat "$WORK/resolve.log" "$WORK/gh_output"; fi
+}
+reject() {
+  local label="$1"; shift
+  if run_resolve "$@"; then fail "accepted: $label"; else pass "rejected: $label"; fi
+}
+
+accept "push to dev-k8s/release deploys to dev" "deploy=true" dev refs/heads/dev-k8s/release push false
+if out "namespace=dev-example-api" && out "runner=akjet-ds-apps" && out "release=example-api" \
+   && out "chart=oci://ghcr.io/example-org/charts/akjet-app"; then
+  pass "namespace is derived from the repository (dev-example-api); runner is the shared akjet-ds-apps"
+else
+  fail "derived target"; cat "$WORK/gh_output"
+fi
+accept "the runner label does not depend on the repository" "runner=akjet-ds-apps" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy "" Example-Org/other-service
+accept "manual run on dev-k8s/release deploys to dev" "deploy=true" dev refs/heads/dev-k8s/release workflow_dispatch false
+accept "another release name stays in the same namespace" "namespace=dev-example-api" dev refs/heads/dev-k8s/release push false "$good_digest" satellite
+accept "other dev-k8s/* branch: validation only, no deployment" "deploy=false" dev refs/heads/dev-k8s/feature-x push true ""
+accept "stage-k8s/release: stage values are validated, no deployment" "deploy=false" stage refs/heads/stage-k8s/release push true ""
+if out "namespace=stage-example-api"; then pass "stage validation renders for namespace stage-example-api"; else fail "stage namespace"; fi
+
+reject "deploy to dev from main" dev refs/heads/main push false
+reject "deploy to dev from dev/v1" dev refs/heads/dev/v1 push false
+reject "deploy to dev from dev/v2" dev refs/heads/dev/v2 push false
+reject "deploy to dev from dev/clockster" dev refs/heads/dev/clockster push false
+reject "deploy to dev from the old branch dev/k8s" dev refs/heads/dev/k8s push false
+reject "deploy to dev from dev-k8s/feature-x" dev refs/heads/dev-k8s/feature-x push false
+reject "deploy to dev from dev-k8s/release/nested" dev refs/heads/dev-k8s/release/nested push false
+reject "deploy to dev from stage-k8s/release" dev refs/heads/stage-k8s/release push false
+reject "deploy to dev from dev-k8s-copy" dev refs/heads/dev-k8s-copy push false
+reject "deploy to dev from a tag named like the branch" dev refs/tags/dev-k8s/release push false
+reject "deploy to dev on a pull_request event" dev refs/heads/dev-k8s/release pull_request false
+reject "deploy to stage from stage-k8s/release" stage refs/heads/stage-k8s/release push false
+reject "deploy to stage from dev-k8s/release" stage refs/heads/dev-k8s/release push false
+reject "deploy to stage by manual run" stage refs/heads/stage-k8s/release workflow_dispatch false
+reject "environment prod" prod refs/heads/main push false
+reject "environment prod, validation only" prod refs/heads/main push true ""
+reject "environment 'dev-other' (namespace injection)" dev-other refs/heads/dev-k8s/release push false
+reject "mutable tag instead of digest" dev refs/heads/dev-k8s/release push false latest
+reject "deployment without a digest" dev refs/heads/dev-k8s/release push false ""
+reject "truncated digest" dev refs/heads/dev-k8s/release push false sha256:abc
+reject "floating chart version" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy "" "" 1.x
+reject "release with shell metacharacters" dev refs/heads/dev-k8s/release push false "$good_digest" 'x;id'
+reject "values-dir outside the repository" dev refs/heads/dev-k8s/release push false "$good_digest" "" ../other
+reject "chart from an arbitrary URL" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy https://example.test/chart.tgz
+reject "repository name unusable as namespace" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy "" Example-Org/Example_API
+
+echo "== build-image.yml: which branches may publish"
+names="$(yq '.jobs.build.steps[] | select(.id == "names") | .run' .github/workflows/build-image.yml)"
+publish_branches="$(yq '.env.PUBLISH_BRANCHES' .github/workflows/build-image.yml)"
+mkdir -p "$WORK/src" && : >"$WORK/src/Dockerfile"
+push_decision() {  # ref-name ref-type push-input
+  : >"$WORK/gh_output"
+  ( cd "$WORK/src" && env -i PATH="$PATH" GITHUB_OUTPUT="$WORK/gh_output" GITHUB_REPOSITORY="Example-Org/example-api" \
+      GITHUB_REPOSITORY_OWNER="Example-Org" PUBLISH_BRANCHES="$publish_branches" GITHUB_REF_NAME="$1" GITHUB_REF_TYPE="$2" \
+      IMAGE_INPUT="" CONTEXT="." DOCKERFILE="Dockerfile" PLATFORM="linux/amd64" PUSH_INPUT="$3" SCAN_FAIL_ON="CRITICAL" \
+      bash -c "$names" >"$WORK/names.log" 2>&1 ) || { echo error; return; }
+  sed -n 's/^push=//p' "$WORK/gh_output"
+}
+expect_push() {  # expected ref-name ref-type push-input
+  local got; got="$(push_decision "$2" "$3" "$4")"
+  if [ "$got" = "$1" ]; then pass "publish=$1 for $3 $2 (push input: $4)"; else fail "publish for $2: got '$got', expected '$1'"; fi
+}
+expect_push true  dev-k8s/release branch true
+expect_push true  stage-k8s/release branch true
+expect_push false dev-k8s/release branch false
+expect_push false main branch true
+expect_push false dev/v1 branch true
+expect_push false dev/v2 branch true
+expect_push false dev/k8s branch true
+expect_push false stage/k8s branch true
+expect_push false dev-k8s/feature-example branch true
+expect_push false stage-k8s/feature-example branch true
+expect_push false dev-k8s/release/nested branch true
+expect_push false dev-k8s-release branch true
+expect_push false dev-k8s/release tag true
+if out "image=ghcr.io/example-org/example-api" || { push_decision dev-k8s/release branch true >/dev/null; out "image=ghcr.io/example-org/example-api"; }; then
+  pass "image name is derived from the repository: ghcr.io/example-org/example-api"
+else
+  fail "image name"
+fi
+if [ "$(yq '.on.workflow_call.secrets | keys | join(",")' .github/workflows/build-image.yml)" = "build-secrets" ] \
+   && [ "$(yq '.on.workflow_call.secrets.build-secrets.required' .github/workflows/build-image.yml)" = "false" ]; then
+  pass "build-image.yml accepts one optional, explicitly passed secret and no runtime credentials"
+else
+  fail "build-image.yml secrets interface"
+fi
+
+echo "== branch model: Kubernetes workflows next to the existing deployment"
+bm="$WORK/branch-model"; mkdir -p "$bm/ok"
+cp tests/branch-model/legacy/deploy.yml "${templates[@]}" "$bm/ok/"
+if python3 tests/check_branch_model.py "$bm/ok" --legacy-branch dev/v2 >"$WORK/bm.log" 2>&1; then
+  pass "templates next to an existing deploy.yml satisfy the branch model"
+else
+  fail "branch model of the templates"; cat "$WORK/bm.log"
+fi
+triggers() { awk -v b="$1" '$1 == b && $2 == "->" { print $3 }' "$WORK/bm.log"; }
+if [ "$(triggers main)" = "deploy.yml" ] && [ "$(triggers dev/v1)" = "deploy.yml" ] && [ "$(triggers dev/v2)" = "-" ]; then
+  pass "push to main and to dev/v1 triggers only the existing deploy.yml; dev/v2 triggers nothing"
+else
+  fail "legacy branches trigger: main='$(triggers main)' dev/v1='$(triggers dev/v1)' dev/v2='$(triggers dev/v2)'"
+fi
+if [ "$(triggers dev-k8s/release)" = "k8s-build.yml" ] && [ "$(triggers stage-k8s/release)" = "k8s-build.yml" ] \
+   && [ "$(triggers dev-k8s/feature-example)" = "k8s-build.yml" ] && [ "$(triggers stage-k8s/feature-example)" = "k8s-build.yml" ] \
+   && [ "$(triggers dev/k8s)" = "-" ] && [ "$(triggers feature/example)" = "-" ]; then
+  pass "dev-k8s/* and stage-k8s/* trigger only k8s-build.yml; dev/k8s and other branches trigger nothing"
+else
+  fail "kubernetes branches trigger"; cat "$WORK/bm.log"
+fi
+build_tpl="${templates[0]}"
+if [ "$(yq '[.jobs[] | select(.uses != null and (.uses | test("deploy-k8s")) and .with."validate-only" != true)] | length' "$build_tpl")" = "1" ] \
+   && [ "$(yq '.jobs.deploy-dev.with.environment' "$build_tpl")" = "dev" ]; then
+  pass "k8s-build.yml has exactly one deploying job and it targets dev"
+else
+  fail "deploying jobs in the template"
+fi
+for case_file in tests/branch-model/bad/*.yml; do
+  name="$(basename "$case_file" .yml)"
+  expected="$(sed -n 's/^# expect: //p' "$case_file")"
+  mkdir -p "$bm/$name" && cp "$case_file" "$bm/$name/$(sed -n 's/^# as: //p' "$case_file")"
+  if python3 tests/check_branch_model.py "$bm/$name" >"$WORK/bm-bad.log" 2>&1; then
+    fail "$name: was accepted"
+  elif grep -qF -- "$expected" "$WORK/bm-bad.log"; then
+    pass "$name: rejected"
+  else
+    fail "$name: rejected for another reason"; cat "$WORK/bm-bad.log"
+  fi
+done
+
+echo "== existing server deployment is untouched"
+legacy_files=(.github/workflows/deploy.yml netbird/action.yml)
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  if git diff --quiet HEAD -- "${legacy_files[@]}"; then
+    pass "deploy.yml and netbird/action.yml are identical to the committed versions"
+  else
+    fail "an existing deployment file was modified"
+  fi
+fi
+if [ "$(yq '.on | keys | join(",")' .github/workflows/deploy.yml)" = "workflow_call" ] \
+   && ! grep -qE 'helm|kubectl|deploy-k8s|build-image' "${legacy_files[@]}"; then
+  pass "deploy.yml is still a workflow_call interface with no Kubernetes steps"
+else
+  fail "existing deploy.yml interface"
+fi
+if grep -lE 'uses: +(\./)?\.github/workflows/deploy\.yml|/netbird@' "${new_workflows[@]}" "${templates[@]}" >"$WORK/cross.log"; then
+  fail "a Kubernetes workflow depends on the existing server deployment"; cat "$WORK/cross.log"
+else
+  pass "Kubernetes workflows do not depend on the existing deploy.yml or the VPN action"
+fi
+
+echo "== repository hygiene"
+# The repository is public: no private addresses and no credentials in the chart, tests or docs.
+if grep -rnE '\b(10\.[0-9]+\.[0-9]+\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+)\b' \
+     charts tests docs examples "${new_workflows[@]}" >"$WORK/addr.log"; then
+  fail "private network addresses found"; cat "$WORK/addr.log"
+else
+  pass "no private network addresses in new files"
+fi
+if command -v shellcheck >/dev/null 2>&1; then
+  if shellcheck tests/run.sh; then pass "shellcheck tests/run.sh"; else fail "shellcheck tests/run.sh"; fi
+fi
+
+echo
+if [ "$fails" -eq 0 ]; then echo "ALL CHECKS PASSED"; else echo "$fails CHECK(S) FAILED"; exit 1; fi

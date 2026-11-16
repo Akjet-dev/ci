@@ -1,0 +1,103 @@
+# Defaults of the shared chart. Everything service-specific belongs to the service repository
+# (deploy/values.yaml and deploy/values-<environment>.yaml). Full reference: docs/chart.md
+
+# One image for all components of the release. The digest is set by the deploy workflow; tags are rejected.
+image:
+  repository: ""            # ghcr.io/<owner>/<image>
+  digest: ""                # sha256:<64 hex>
+  pullPolicy: IfNotPresent
+
+# Names of existing image pull Secrets in the namespace (created by the platform, not by this chart).
+imagePullSecrets: []
+
+serviceAccount:
+  create: true              # <release>; the API token is never mounted
+  name: ""                  # use an existing ServiceAccount instead (create: false)
+
+# Pod-level identity. The image must run as a non-root numeric user; set runAsUser if the image
+# declares a named user or none.
+podSecurity: {}
+#  runAsUser: 10001
+#  runAsGroup: 10001
+#  fsGroup: 10001
+
+# Root filesystem is read-only; list directories the process writes to in components.<name>.writablePaths.
+readOnlyRootFilesystem: true
+
+# Non-secret environment variables for every component -> ConfigMap <release>-config.
+# Values are strings. Names that look like credentials are rejected by the schema.
+config: {}
+
+# Declaration of the Kubernetes Secrets this release expects to exist: <name> -> list of keys.
+# The Secret object is called <release>-<name>. The chart never creates it and never sees its values;
+# every Secret referenced below must be declared here.
+requiredSecrets: {}
+#  app: [APP_KEY, DB_PASSWORD]
+
+# Declared Secrets injected as a whole (envFrom) into every component.
+envFromSecrets: []
+#  - app
+
+# Single keys injected under an explicit variable name into every component.
+secretEnv: {}
+#  DATABASE_PASSWORD: { secret: app, key: DB_PASSWORD }
+
+# Single keys mounted as read-only files into every component.
+secretFiles: []
+#  - { secret: files, key: SERVICE_ACCOUNT_JSON, mountPath: /var/run/secrets/app/service-account.json }
+
+# At least one component. Each one is a Deployment running the release image.
+components: {}
+#  web:
+#    replicas: 1
+#    command: []                 # default: image ENTRYPOINT
+#    args: []
+#    ports: { http: 8080 }       # name -> containerPort
+#    service: { enabled: true }  # ClusterIP Service <release>-web with the same ports
+#    strategy: RollingUpdate     # or Recreate (single replica only)
+#    terminationGracePeriodSeconds: 30
+#    probes:
+#      readiness: { path: /healthz, port: http }
+#      liveness:  { path: /healthz, port: http }
+#    resources:
+#      requests: { cpu: 50m, memory: 64Mi }
+#      limits: { memory: 128Mi }
+#    writablePaths: [/tmp]       # emptyDir mounts
+#    config: {}                  # variables of this component only
+#    envFromSecrets: []
+#    secretEnv: {}
+
+# HTTPRoute objects. Disabled by default: enable only after the platform has assigned the hostname.
+httpRoute:
+  enabled: false
+  parentRef: {}
+#    name: <gateway>
+#    namespace: <gateway namespace>
+#    sectionName: <listener>
+  routes: []
+#    - component: web
+#      port: http
+#      hostnames: [app.example.test]
+#      paths: [{ type: PathPrefix, value: / }]
+
+# Database migration Job. It is NOT part of the release: the deploy workflow renders it separately
+# (migration.render=true, migration.runId=<unique>) and runs it before `helm upgrade`.
+migration:
+  enabled: false
+  render: false
+  runId: ""
+  command: []
+  args: []
+  config: {}
+  envFromSecrets: []
+  secretEnv: {}
+  writablePaths: [/tmp]
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+#  resources:
+#    requests: { cpu: 50m, memory: 128Mi }
+#    limits: { memory: 256Mi }
+
+# Changing this value restarts all pods without changing the image (set by the deploy workflow after a
+# Secret was updated).
+rolloutRevision: ""

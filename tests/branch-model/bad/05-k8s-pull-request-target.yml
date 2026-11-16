@@ -1,0 +1,9 @@
+# expect: B1 k8s-build.yml: events ['pull_request_target']
+# as: k8s-build.yml
+name: K8s build
+on:
+  pull_request_target:
+  push:
+    branches: ['dev-k8s/**']
+jobs:
+  t: { runs-on: ubuntu-24.04, steps: [{ run: "true" }] }

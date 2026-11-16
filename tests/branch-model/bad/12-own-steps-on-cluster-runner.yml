@@ -1,0 +1,10 @@
+# expect: B6 k8s-build.yml:shell: own steps must run on a GitHub-hosted runner
+# as: k8s-build.yml
+name: K8s build
+on:
+  push:
+    branches: ['dev-k8s/**']
+jobs:
+  shell:
+    runs-on: akjet-ds-apps
+    steps: [{ run: "kubectl get pods" }]

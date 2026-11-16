@@ -1,0 +1,10 @@
+# expect: B4 deploy.yml: existing workflow calls a Kubernetes reusable workflow
+# as: deploy.yml
+name: Deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    uses: example-org/ci/.github/workflows/deploy-k8s.yml@0000000000000000000000000000000000000000
+    with: { environment: dev, validate-only: true, chart-version: 0.1.0 }

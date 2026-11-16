@@ -1,0 +1,26 @@
+{{- $root := . }}
+{{- range $name := keys .Values.components | sortAlpha }}
+{{- $c := get $root.Values.components $name }}
+{{- if ($c.service | default dict).enabled }}
+{{- $ctx := dict "root" $root "component" $name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "akjet-app.componentName" $ctx }}
+  labels:
+    {{- include "akjet-app.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "akjet-app.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    {{- range $portName := keys $c.ports | sortAlpha }}
+    - name: {{ $portName }}
+      port: {{ get $c.ports $portName }}
+      targetPort: {{ $portName }}
+      protocol: TCP
+    {{- end }}
+{{- end }}
+{{- end }}

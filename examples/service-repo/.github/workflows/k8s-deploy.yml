@@ -1,0 +1,39 @@
+# Template for a service repository: copy to .github/workflows/k8s-deploy.yml.
+# Manual entry point: deploy a chosen digest to the DEV namespace again (rollback, restart after a
+# Secret change, migrations). Run it from the branch dev-k8s/release - any other branch is rejected.
+# DEV is the only target of this file: stage is deployed by the platform-controlled dispatcher.
+# Manual runs are offered by GitHub only once this file exists on the default branch.
+#
+# Replace <CI_COMMIT> with the full commit SHA of the shared ci repository.
+name: K8s deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: 'Image digest, sha256:... (summary of the "K8s build" run)'
+        required: true
+        type: string
+      run-migrations:
+        description: Run the migration Job before the upgrade
+        type: boolean
+        default: false
+      restart:
+        description: Restart pods (after a Secret was updated)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-dev:
+    name: Deploy to DEV
+    if: github.ref == 'refs/heads/dev-k8s/release' && vars.K8S_DEV_DEPLOY_ENABLED == 'true'
+    uses: example-org/ci/.github/workflows/deploy-k8s.yml@<CI_COMMIT>
+    with:
+      environment: dev
+      image-digest: ${{ inputs.digest }}
+      chart-version: 0.1.0
+      run-migrations: ${{ inputs.run-migrations }}
+      restart: ${{ inputs.restart }}

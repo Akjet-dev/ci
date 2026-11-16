@@ -1,0 +1,6 @@
+# expect: B2 k8s-build.yml: is triggered by a push to main
+# as: k8s-build.yml
+name: K8s build
+on: push
+jobs:
+  t: { runs-on: ubuntu-24.04, steps: [{ run: "true" }] }

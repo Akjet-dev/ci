@@ -1,0 +1,8 @@
+# expect: B2 k8s-build.yml: is triggered by a push to dev/v1
+# as: k8s-build.yml
+name: K8s build
+on:
+  push:
+    branches: ['dev*/**']
+jobs:
+  t: { runs-on: ubuntu-24.04, steps: [{ run: "true" }] }

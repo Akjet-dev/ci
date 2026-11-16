@@ -1,0 +1,18 @@
+# Static frontend: one component, no configuration, no Secrets, no route (the default).
+image:
+  repository: ghcr.io/example-org/example-web
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+imagePullSecrets: [registry-pull]
+podSecurity: { runAsUser: 101 }
+components:
+  web:
+    replicas: 1
+    ports: { http: 8080 }
+    service: { enabled: true }
+    probes:
+      readiness: { path: /healthz, port: http }
+      liveness: { path: /healthz, port: http }
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+    writablePaths: [/tmp, /var/cache/nginx]
