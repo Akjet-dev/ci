@@ -282,6 +282,35 @@ reject "values-dir outside the repository" dev refs/heads/dev-k8s/release push f
 reject "chart from an arbitrary URL" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy https://example.test/chart.tgz
 reject "repository name unusable as namespace" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy "" Example-Org/Example_API
 
+echo "== deploy-k8s.yml: private chart registry"
+for job in validate deploy; do
+  if [ "$(yq ".jobs.$job.permissions.packages" "$dk")" = "read" ] && [ "$(yq ".jobs.$job.permissions.contents" "$dk")" = "read" ] \
+     && [ "$(yq ".jobs.$job.permissions | length" "$dk")" = "2" ]; then
+    pass "job $job: permissions are exactly contents: read and packages: read"
+  else
+    fail "job $job: permissions"
+  fi
+done
+pull_steps="$(yq '[.jobs[].steps[] | select(.run != null and (.run | test("helm pull")))] | length' "$dk")"
+# shellcheck disable=SC2016  # the yq expression contains literal ${...} text
+auth_steps="$(yq '[.jobs[].steps[] | select(.run != null and (.run | test("helm pull")) and (.run | test("helm registry login ghcr.io --username \"\\$\\{GITHUB_ACTOR\\}\" --password-stdin")) and (.run | test("helm registry logout ghcr.io")) and .env.GITHUB_TOKEN == "${{ github.token }}")] | length' "$dk")"
+if [ "$pull_steps" = "2" ] && [ "$auth_steps" = "2" ]; then
+  pass "both steps that pull the chart log in to ghcr.io with the job token (stdin) and log out again"
+else
+  fail "chart pull authentication: $auth_steps of $pull_steps steps"
+fi
+if grep -nE 'helm registry login[^|]*--password[ =]|secrets\.[A-Za-z_]*(PAT|TOKEN)' "$dk" >"$WORK/pat.log"; then
+  fail "the chart login must use the job token on stdin, no PAT and no --password argument"; cat "$WORK/pat.log"
+else
+  pass "no personal access token and no password on a command line"
+fi
+tpl_ok=true
+for tpl in "${templates[@]}"; do
+  missing="$(yq '[.jobs[] | select(.uses != null and (.uses | test("/deploy-k8s.yml@")) and (.permissions.packages != "read" or .permissions.contents != "read"))] | length' "$tpl")"
+  [ "$missing" = "0" ] || { tpl_ok=false; echo "      $tpl: $missing calling job(s) without contents: read + packages: read"; }
+done
+if $tpl_ok; then pass "templates: every job calling deploy-k8s.yml grants contents: read and packages: read"; else fail "template caller permissions"; fi
+
 echo "== build-image.yml: which branches may publish"
 names="$(yq '.jobs.build.steps[] | select(.id == "names") | .run' .github/workflows/build-image.yml)"
 publish_branches="$(yq '.env.PUBLISH_BRANCHES' .github/workflows/build-image.yml)"
