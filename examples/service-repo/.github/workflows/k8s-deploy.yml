@@ -30,6 +30,11 @@ jobs:
   deploy-dev:
     name: Deploy to DEV
     if: github.ref == 'refs/heads/dev-k8s/release' && vars.K8S_DEV_DEPLOY_ENABLED == 'true'
+    # The shared chart is a private GHCR package: the called workflow needs packages: read, and a called
+    # workflow can never have more permissions than the calling job grants.
+    permissions:
+      contents: read
+      packages: read
     uses: example-org/ci/.github/workflows/deploy-k8s.yml@<CI_COMMIT>
     with:
       environment: dev

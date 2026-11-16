@@ -88,8 +88,10 @@ jobs:
     name: Validate
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # packages: read - the shared chart is a private GHCR package. The calling job must grant it as well.
     permissions:
       contents: read
+      packages: read
     outputs:
       namespace: ${{ steps.target.outputs.namespace }}
       release: ${{ steps.target.outputs.release }}
@@ -206,14 +208,29 @@ jobs:
           NAMESPACE: ${{ steps.target.outputs.namespace }}
           RELEASE: ${{ steps.target.outputs.release }}
           CHART: ${{ steps.target.outputs.chart }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           for f in "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"; do
             test -f "${f}" || { echo "::error::values file not found: ${f}"; exit 1; }
           done
+          # The chart package is private: log in with the job token (packages: read). The token is read
+          # from stdin, never from the command line, and the login is removed again right after the pull.
+          pull_chart() {
+            case "${CHART}" in
+              oci://ghcr.io/*)
+                printf '%s' "${GITHUB_TOKEN}" | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin >/dev/null
+                helm pull "${CHART}" --version "${CHART_VERSION}" --untar --untardir "${RUNNER_TEMP}/chart" \
+                  || { helm registry logout ghcr.io >/dev/null 2>&1 || true
+                       echo "::error::cannot pull ${CHART} ${CHART_VERSION}: the calling job needs 'packages: read' and the package must grant this repository Actions read access"; exit 1; }
+                helm registry logout ghcr.io >/dev/null 2>&1 || true ;;
+              *)
+                helm pull "${CHART}" --version "${CHART_VERSION}" --untar --untardir "${RUNNER_TEMP}/chart" ;;
+            esac
+          }
           case "${CHART}" in
             oci://*)
-              helm pull "${CHART}" --version "${CHART_VERSION}" --untar --untardir "${RUNNER_TEMP}/chart"
+              pull_chart
               chart_dir="$(find "${RUNNER_TEMP}/chart" -mindepth 1 -maxdepth 1 -type d | head -1)" ;;
             *) chart_dir="${CHART}" ;;
           esac
@@ -275,6 +292,7 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+      packages: read
 
     # One Helm operation per release at a time; a running deployment is never cancelled.
     concurrency:
@@ -330,14 +348,30 @@ jobs:
 
       - name: Fetch the chart
         id: chart
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           for f in "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"; do
             test -f "${f}" || { echo "::error::values file not found: ${f}"; exit 1; }
           done
+          # The chart package is private: log in with the job token (packages: read). The token is read
+          # from stdin, never from the command line, and the login is removed again right after the pull.
+          pull_chart() {
+            case "${CHART}" in
+              oci://ghcr.io/*)
+                printf '%s' "${GITHUB_TOKEN}" | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin >/dev/null
+                helm pull "${CHART}" --version "${CHART_VERSION}" --untar --untardir "${RUNNER_TEMP}/chart" \
+                  || { helm registry logout ghcr.io >/dev/null 2>&1 || true
+                       echo "::error::cannot pull ${CHART} ${CHART_VERSION}: the calling job needs 'packages: read' and the package must grant this repository Actions read access"; exit 1; }
+                helm registry logout ghcr.io >/dev/null 2>&1 || true ;;
+              *)
+                helm pull "${CHART}" --version "${CHART_VERSION}" --untar --untardir "${RUNNER_TEMP}/chart" ;;
+            esac
+          }
           case "${CHART}" in
             oci://*)
-              helm pull "${CHART}" --version "${CHART_VERSION}" --untar --untardir "${RUNNER_TEMP}/chart"
+              pull_chart
               echo "dir=$(find "${RUNNER_TEMP}/chart" -mindepth 1 -maxdepth 1 -type d | head -1)" >> "${GITHUB_OUTPUT}" ;;
             *) echo "dir=${CHART}" >> "${GITHUB_OUTPUT}" ;;
           esac
