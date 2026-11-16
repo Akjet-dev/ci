@@ -352,6 +352,75 @@ else
   fail "build-image.yml secrets interface"
 fi
 
+echo "== build-image.yml: vulnerability scan (advisory / strict)"
+bi=.github/workflows/build-image.yml
+scan="$(yq '.jobs.build.steps[] | select(.id == "scan") | .run' "$bi")"
+mkdir -p "$WORK/trivy-bin" && cp tests/fixtures/trivy "$WORK/trivy-bin/trivy"
+run_scan() {  # fake-trivy-mode block-on-cves scan-fail-on
+  : >"$WORK/scan_summary"; : >"$WORK/scan_output"; rm -f "$WORK/trivy-report.json"
+  env -i PATH="$WORK/trivy-bin:$PATH" RUNNER_TEMP="$WORK" GITHUB_STEP_SUMMARY="$WORK/scan_summary" \
+    GITHUB_OUTPUT="$WORK/scan_output" GITHUB_SHA=0000000 IMAGE=ghcr.io/example-org/example-api \
+    FAKE_TRIVY="$1" TRIVY_BLOCK_ON_CVES="$2" SCAN_FAIL_ON="$3" bash -c "$scan" >"$WORK/scan.log" 2>&1
+}
+scan_case() {  # label, expected (pass|block), expected text in the log, mode, block, fail-on
+  local label="$1" expected="$2" text="$3" rc=0; shift 3
+  run_scan "$@" || rc=$?
+  if { [ "$expected" = "pass" ] && [ "$rc" -eq 0 ]; } || { [ "$expected" = "block" ] && [ "$rc" -ne 0 ]; }; then
+    if grep -qF -- "$text" "$WORK/scan.log"; then pass "$label"; else fail "$label: '$text' not in the log"; cat "$WORK/scan.log"; fi
+  else
+    fail "$label: exit code $rc, expected $expected"; cat "$WORK/scan.log"
+  fi
+}
+scan_case "advisory: CRITICAL vulnerabilities do not stop the build" pass "ADVISORY MODE: 2 fixable vulnerabilities" critical false HIGH,CRITICAL
+if grep -qx 'critical=1' "$WORK/scan_output" && grep -qx 'high=2' "$WORK/scan_output" \
+   && grep -q 'CRITICAL vulnerabilities | 1' "$WORK/scan_summary" && grep -q 'HIGH vulnerabilities | 2' "$WORK/scan_summary" \
+   && grep -q 'findings: mode=critical' "$WORK/scan.log" && jq -e '.Results[0].Vulnerabilities | length == 3' "$WORK/trivy-report.json" >/dev/null; then
+  pass "advisory: findings stay visible (scanner output in the log, counts in the summary and outputs, JSON report kept)"
+else
+  fail "advisory: findings are not visible"; cat "$WORK/scan_summary" "$WORK/scan_output"
+fi
+scan_case "advisory: CRITICAL gate severity only - still does not stop the build" pass "ADVISORY MODE: 1 fixable vulnerabilities" critical false CRITICAL
+scan_case "advisory: HIGH vulnerabilities do not stop the build" pass "ADVISORY MODE: 2 fixable vulnerabilities" high false HIGH,CRITICAL
+scan_case "advisory: a clean image passes without a warning" pass "Trivy: CRITICAL=0 HIGH=0" clean false CRITICAL
+scan_case "advisory: scanner failure is an error, not a finding" block "Trivy failed to scan the image" fail false CRITICAL
+scan_case "advisory: failure while writing the report is an error" block "Trivy failed to write the scan report" fail-json false CRITICAL
+scan_case "advisory: an unreadable report is an error" block "report is missing or not valid" garbage false CRITICAL
+scan_case "advisory: embedded secrets still stop the build" block "embedded secret(s)" secret false CRITICAL
+scan_case "strict: embedded secrets stop the build" block "embedded secret(s)" secret true CRITICAL
+scan_case "strict: CRITICAL vulnerabilities stop the build" block "fixable vulnerabilities of severity CRITICAL; it is not published" critical true CRITICAL
+scan_case "strict: HIGH vulnerabilities stop the build when HIGH is a gate severity" block "it is not published" high true HIGH,CRITICAL
+scan_case "strict: HIGH vulnerabilities pass when only CRITICAL is a gate severity" pass "Trivy: CRITICAL=0 HIGH=2" high true CRITICAL
+scan_case "strict: vulnerabilities without a fix are reported, not blocking" pass "Trivy: CRITICAL=1 HIGH=0 fixable=0" unfixed true CRITICAL
+scan_case "strict: a clean image passes" pass "Trivy: CRITICAL=0 HIGH=0" clean true CRITICAL
+scan_case "strict: scanner failure is an error" block "Trivy failed to scan the image" fail true CRITICAL
+
+if [ "$(yq '.env.TRIVY_BLOCK_ON_CVES' "$bi")" = "false" ] && [ "$(grep -cE '^\s*TRIVY_BLOCK_ON_CVES:' "$bi")" = "1" ]; then
+  pass "TRIVY_BLOCK_ON_CVES is 'false' (advisory) and is defined in exactly one line"
+else
+  fail "TRIVY_BLOCK_ON_CVES must be defined once, currently 'false'"
+fi
+if grep -nE 'continue-on-error' "$bi" >"$WORK/coe.log" || echo "$scan" | grep -nE 'trivy .*\|\| *true|set \+e' >>"$WORK/coe.log"; then
+  fail "scanner failures must not be hidden (continue-on-error / || true)"; cat "$WORK/coe.log"
+else
+  pass "no continue-on-error and no '|| true' around the scanner"
+fi
+if echo "$scan" | grep -q -- '--severity "HIGH,CRITICAL"' && ! echo "$scan" | grep -q -- '--ignore-unfixed' \
+   && echo "$scan" | grep -q -- '--scanners "vuln,secret"'; then
+  pass "the scan still covers HIGH and CRITICAL vulnerabilities and secrets, nothing is filtered out"
+else
+  fail "scan coverage changed"
+fi
+order="$(yq '[.jobs.build.steps[].name] | join(" > ")' "$bi")"
+case "$order" in
+  *"Build > Install Trivy > Scan for vulnerabilities > Keep the scan report > Push"*) pass "order: build, scan, keep the report, then push" ;;
+  *) fail "step order: $order" ;;
+esac
+if [ "$(yq '.jobs.build.steps[] | select(.name == "Push") | .if' "$bi")" = "steps.names.outputs.push == 'true'" ]; then
+  pass "publication depends only on the branch decision and on the previous steps succeeding"
+else
+  fail "Push step condition changed"
+fi
+
 echo "== branch model: Kubernetes workflows next to the existing deployment"
 bm="$WORK/branch-model"; mkdir -p "$bm/ok"
 cp tests/branch-model/legacy/deploy.yml "${templates[@]}" "$bm/ok/"

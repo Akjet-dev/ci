@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Test double of the trivy CLI for tests/run.sh. FAKE_TRIVY selects what the "scan" finds:
+#   clean | high | critical | unfixed | secret | fail | fail-json | garbage
+set -euo pipefail
+mode="${FAKE_TRIVY:-clean}"
+out=""; json=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift ;;
+    --format) [ "$2" = "json" ] && json=true; shift ;;
+  esac
+  shift
+done
+vuln() { printf '{"VulnerabilityID":"CVE-0000-%s","PkgName":"pkg","Severity":"%s","FixedVersion":"%s"}' "$1" "$2" "$3"; }
+case "${mode}" in
+  fail) echo "FATAL image scan error: unable to inspect the image" >&2; exit 1 ;;
+  clean) vulns=""; secrets="" ;;
+  high) vulns="$(vuln 1 HIGH 1.2.3),$(vuln 2 HIGH 1.2.4)"; secrets="" ;;
+  critical) vulns="$(vuln 1 CRITICAL 2.0.0),$(vuln 2 HIGH 1.2.3),$(vuln 3 HIGH '')"; secrets="" ;;
+  unfixed) vulns="$(vuln 1 CRITICAL '')"; secrets="" ;;
+  secret) vulns=""; secrets='{"RuleID":"private-key","Category":"AsymmetricPrivateKey","Severity":"CRITICAL","Title":"Private key","Match":"*****"}' ;;
+  fail-json|garbage) vulns=""; secrets="" ;;
+  *) echo "unknown FAKE_TRIVY mode ${mode}" >&2; exit 64 ;;
+esac
+if ! ${json}; then
+  echo "example-image (alpine 3.21.3)"
+  echo "WARN This OS version is no longer supported by the distribution"
+  echo "findings: mode=${mode}"
+  exit 0
+fi
+case "${mode}" in
+  fail-json) echo "FATAL unable to write the report" >&2; exit 1 ;;
+  garbage) printf 'not a report' > "${out}"; exit 0 ;;
+esac
+printf '{"SchemaVersion":2,"ArtifactName":"example-image","Results":[{"Target":"example-image (alpine 3.21.3)","Class":"os-pkgs","Vulnerabilities":[%s]},{"Target":"/app/key.pem","Class":"secret","Secrets":[%s]}]}\n' \
+  "${vulns}" "${secrets}" > "${out}"

@@ -74,6 +74,11 @@ permissions:
 env:
   # Branches that may publish images, space separated. Deliberately not an input.
   PUBLISH_BRANCHES: 'dev-k8s/release stage-k8s/release'
+  # Vulnerability gate. 'false' = ADVISORY (temporary, for the Kubernetes migration): vulnerabilities are
+  # scanned, reported and counted, but do not stop the build or the publication. 'true' = an image with
+  # fixable vulnerabilities of a severity listed in scan-fail-on is not published.
+  # Embedded secrets and scanner failures stop the build in both modes.
+  TRIVY_BLOCK_ON_CVES: 'false'
   TRIVY_VERSION: '0.76.1'
   TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
 
@@ -161,7 +166,7 @@ jobs:
           docker buildx inspect --bootstrap
 
       # The image is built into the local Docker engine first, scanned there, and pushed only afterwards:
-      # an image that fails the scan never reaches the registry.
+      # an image stopped by the scan step never reaches the registry.
       - name: Build
         id: build
         env:
@@ -222,26 +227,92 @@ jobs:
 
           docker buildx build "${args[@]}" "${CONTEXT}"
 
+      - name: Install Trivy
+        if: inputs.scan
+        run: |
+          set -euo pipefail
+          bin="${RUNNER_TEMP}/bin"; mkdir -p "${bin}"; cd "${RUNNER_TEMP}"
+          curl -fsSLo trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz -C "${bin}" trivy
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      # Three different outcomes, never mixed up:
+      #   the scanner could not run or produced no usable report  -> error, in every mode
+      #   secrets embedded in the image (severity in scan-fail-on) -> error, in every mode
+      #   vulnerabilities                                          -> reported; they stop the build only
+      #                                                               when TRIVY_BLOCK_ON_CVES is 'true'
       - name: Scan for vulnerabilities
+        id: scan
         if: inputs.scan
         env:
           IMAGE: ${{ steps.names.outputs.image }}
           SCAN_FAIL_ON: ${{ inputs.scan-fail-on }}
         run: |
           set -euo pipefail
-          cd "${RUNNER_TEMP}"
-          curl -fsSLo trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
-          tar -xzf trivy.tgz trivy
           ref="${IMAGE}:sha-${GITHUB_SHA}"
-          # Report everything that has a fix; secrets baked into the image are reported as well.
-          ./trivy image --image-src docker --scanners vuln,secret --ignore-unfixed --no-progress \
-            --severity HIGH,CRITICAL --exit-code 0 "${ref}"
-          if [ -n "${SCAN_FAIL_ON}" ]; then
-            ./trivy image --image-src docker --scanners vuln,secret --ignore-unfixed --no-progress --quiet \
-              --severity "${SCAN_FAIL_ON}" --exit-code 1 "${ref}" >/dev/null \
-              || { echo "::error::the image has fixable vulnerabilities or embedded secrets of severity ${SCAN_FAIL_ON}; it is not published"; exit 1; }
+          report="${RUNNER_TEMP}/trivy-report.json"
+          common=(image --image-src docker --scanners "vuln,secret" --no-progress --severity "HIGH,CRITICAL" --exit-code 0)
+
+          # 1. Human-readable report in the job log: every HIGH and CRITICAL finding, fixable or not.
+          trivy "${common[@]}" "${ref}" \
+            || { echo "::error::Trivy failed to scan the image (scanner error, not a finding)"; exit 1; }
+          # 2. The same scan as JSON: counted below and kept as an artifact.
+          trivy "${common[@]}" --quiet --format json --output "${report}" "${ref}" \
+            || { echo "::error::Trivy failed to write the scan report (scanner error, not a finding)"; exit 1; }
+          jq -e '.SchemaVersion != null' "${report}" >/dev/null \
+            || { echo "::error::the Trivy report is missing or not valid (scanner error, not a finding)"; exit 1; }
+
+          gate="$(printf '%s' "${SCAN_FAIL_ON}" | jq -Rc 'split(",") | map(select(length > 0))')"
+          count() { jq --argjson gate "${gate}" "$1" "${report}"; }
+          high="$(count '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length')"
+          critical="$(count '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length')"
+          fixable="$(count '[.Results[]?.Vulnerabilities[]? | select((.FixedVersion // "") != "")] | length')"
+          # shellcheck disable=SC2016  # $s and $gate are jq variables
+          gated="$(count '[.Results[]?.Vulnerabilities[]? | select((.FixedVersion // "") != "") | select(.Severity as $s | $gate | index($s))] | length')"
+          secrets="$(count '[.Results[]?.Secrets[]?] | length')"
+          # shellcheck disable=SC2016
+          gated_secrets="$(count '[.Results[]?.Secrets[]? | select(.Severity as $s | $gate | index($s))] | length')"
+
+          {
+            echo "### Vulnerability scan"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| CRITICAL vulnerabilities | ${critical} |"
+            echo "| HIGH vulnerabilities | ${high} |"
+            echo "| of them with a fix available | ${fixable} |"
+            echo "| Embedded secrets | ${secrets} |"
+            echo "| Gate severities (scan-fail-on) | \`${SCAN_FAIL_ON:-none}\` |"
+            echo "| Vulnerabilities block publication | \`${TRIVY_BLOCK_ON_CVES}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          {
+            echo "critical=${critical}"
+            echo "high=${high}"
+            echo "secrets=${secrets}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Trivy: CRITICAL=${critical} HIGH=${high} fixable=${fixable} secrets=${secrets}"
+
+          if [ "${gated_secrets}" -gt 0 ]; then
+            echo "::error::the image contains ${gated_secrets} embedded secret(s) of severity ${SCAN_FAIL_ON}; it is not published"
+            exit 1
           fi
+          if [ "${gated}" -gt 0 ]; then
+            if [ "${TRIVY_BLOCK_ON_CVES}" = "true" ]; then
+              echo "::error::the image has ${gated} fixable vulnerabilities of severity ${SCAN_FAIL_ON}; it is not published"
+              exit 1
+            fi
+            echo "::warning::ADVISORY MODE: ${gated} fixable vulnerabilities of severity ${SCAN_FAIL_ON} (CRITICAL=${critical}, HIGH=${high} in total) do not block this build (TRIVY_BLOCK_ON_CVES=${TRIVY_BLOCK_ON_CVES})"
+          fi
+
+      - name: Keep the scan report
+        if: always() && inputs.scan
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trivy-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/trivy-report.json
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Push
         id: publish
