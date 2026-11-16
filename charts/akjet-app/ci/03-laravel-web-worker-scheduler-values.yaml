@@ -1,0 +1,46 @@
+# One image, three components with different commands, strategies and grace periods.
+image:
+  repository: ghcr.io/example-org/example-api
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+config:
+  APP_ENV: dev
+  LOG_CHANNEL: stderr
+  QUEUE_CONNECTION: database
+requiredSecrets:
+  app: [APP_KEY, DB_PASSWORD]
+  payments: [PAYMENT_API_TOKEN]
+envFromSecrets: [app]
+components:
+  web:
+    replicas: 2
+    ports: { http: 8080 }
+    service: { enabled: true }
+    probes:
+      readiness: { path: /up, port: http }
+      liveness: { path: /up, port: http }
+    resources:
+      requests: { cpu: 100m, memory: 192Mi }
+      limits: { memory: 384Mi }
+    writablePaths: [/tmp, /app/storage/framework, /app/bootstrap/cache]
+  worker:
+    replicas: 1
+    command: ["php", "artisan", "queue:work"]
+    args: ["--queue=default", "--max-time=3600"]
+    terminationGracePeriodSeconds: 70
+    probes:
+      liveness: { exec: ["php", "artisan", "app:health"], periodSeconds: 60, timeoutSeconds: 10 }
+    resources:
+      requests: { cpu: 50m, memory: 192Mi }
+      limits: { cpu: 500m, memory: 384Mi }
+    writablePaths: [/tmp, /app/storage/framework, /app/bootstrap/cache]
+    config:
+      WORKER_ROLE: "queue"
+    envFromSecrets: [payments]
+  scheduler:
+    replicas: 1
+    strategy: Recreate
+    command: ["php", "artisan", "schedule:work"]
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { memory: 256Mi }
+    writablePaths: [/tmp, /app/storage/framework, /app/bootstrap/cache]

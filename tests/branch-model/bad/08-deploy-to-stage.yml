@@ -1,0 +1,11 @@
+# expect: B5 k8s-build.yml:deploy: a deploying job must target the literal environment 'dev'
+# as: k8s-build.yml
+name: K8s build
+on:
+  push:
+    branches: ['stage-k8s/**']
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/dev-k8s/release' && vars.K8S_DEV_DEPLOY_ENABLED == 'true'
+    uses: example-org/ci/.github/workflows/deploy-k8s.yml@0000000000000000000000000000000000000000
+    with: { environment: stage, image-digest: "sha256:x", chart-version: 0.1.0 }

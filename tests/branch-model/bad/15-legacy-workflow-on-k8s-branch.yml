@@ -1,0 +1,8 @@
+# expect: B3 deploy.yml: existing workflow is triggered by a push to dev-k8s/release
+# as: deploy.yml
+name: Deploy
+on:
+  push:
+    branches: [dev/v1, main, dev-k8s/release]
+jobs:
+  deploy: { runs-on: ubuntu-latest, steps: [{ run: "true" }] }

@@ -1,0 +1,5 @@
+# expect: components
+image:
+  repository: ghcr.io/example-org/example-api
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+components: {}

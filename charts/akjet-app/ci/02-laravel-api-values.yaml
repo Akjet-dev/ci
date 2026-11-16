@@ -1,0 +1,31 @@
+# Laravel API with PostgreSQL: non-secret settings in config, credentials only as Secret references.
+image:
+  repository: ghcr.io/example-org/example-api
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+imagePullSecrets: [registry-pull]
+podSecurity: { runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001 }
+config:
+  APP_ENV: dev
+  APP_URL: https://api.example.test
+  LOG_CHANNEL: stderr
+  DB_CONNECTION: pgsql
+  DB_HOST: postgres.example.test
+  DB_PORT: "5432"
+  DB_DATABASE: example_dev
+  DB_USERNAME: example_dev_app
+requiredSecrets:
+  app: [APP_KEY, DB_PASSWORD]
+envFromSecrets: [app]
+components:
+  web:
+    replicas: 2
+    ports: { http: 8080 }
+    service: { enabled: true }
+    probes:
+      startup: { path: /up, port: http, periodSeconds: 5, failureThreshold: 30 }
+      readiness: { path: /up, port: http }
+      liveness: { path: /up, port: http, periodSeconds: 20 }
+    resources:
+      requests: { cpu: 100m, memory: 192Mi }
+      limits: { memory: 384Mi }
+    writablePaths: [/tmp, /app/storage/framework, /app/bootstrap/cache]

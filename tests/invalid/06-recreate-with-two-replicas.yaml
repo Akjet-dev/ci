@@ -1,0 +1,9 @@
+# expect: replicas
+image:
+  repository: ghcr.io/example-org/example-api
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+components:
+  scheduler:
+    strategy: Recreate
+    replicas: 2
+    resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 128Mi } }

@@ -1,0 +1,102 @@
+{{- $root := . }}
+{{- range $name := keys .Values.components | sortAlpha }}
+{{- $c := get $root.Values.components $name }}
+{{- $ctx := dict "root" $root "component" $name }}
+{{- $strategy := $c.strategy | default "RollingUpdate" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "akjet-app.componentName" $ctx }}
+  labels:
+    {{- include "akjet-app.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: {{ $c.replicas | default 1 }}
+  revisionHistoryLimit: 5
+  strategy:
+    {{- if eq $strategy "Recreate" }}
+    type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "akjet-app.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "akjet-app.labels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $name }}
+      annotations:
+        checksum/config: {{ $root.Values.config | toJson | sha256sum }}
+        {{- with $root.Values.rolloutRevision }}
+        akjet.kz/rollout-revision: {{ . | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "akjet-app.serviceAccountName" $root }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ $c.terminationGracePeriodSeconds | default 30 }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      securityContext:
+        {{- include "akjet-app.podSecurityContext" $root | nindent 8 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "akjet-app.image" $root | quote }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          {{- with $c.command }}
+          command: {{ toJson . }}
+          {{- end }}
+          {{- with $c.args }}
+          args: {{ toJson . }}
+          {{- end }}
+          securityContext:
+            {{- include "akjet-app.containerSecurityContext" $root | nindent 12 }}
+          {{- with $c.ports }}
+          ports:
+            {{- range $portName := keys . | sortAlpha }}
+            - name: {{ $portName }}
+              containerPort: {{ get $c.ports $portName }}
+              protocol: TCP
+            {{- end }}
+          {{- end }}
+          {{- with include "akjet-app.envFrom" (dict "root" $root "scope" $c "configMap" true) }}
+          envFrom:
+            {{- . | nindent 12 }}
+          {{- end }}
+          {{- with include "akjet-app.env" (dict "root" $root "plain" $c.config "scope" $c) }}
+          env:
+            {{- . | nindent 12 }}
+          {{- end }}
+          {{- with ($c.probes | default dict).startup }}
+          startupProbe:
+            {{- include "akjet-app.probe" . | nindent 12 }}
+          {{- end }}
+          {{- with ($c.probes | default dict).readiness }}
+          readinessProbe:
+            {{- include "akjet-app.probe" . | nindent 12 }}
+          {{- end }}
+          {{- with ($c.probes | default dict).liveness }}
+          livenessProbe:
+            {{- include "akjet-app.probe" . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          {{- with include "akjet-app.volumeMounts" (dict "root" $root "paths" $c.writablePaths) }}
+          volumeMounts:
+            {{- . | nindent 12 }}
+          {{- end }}
+      {{- with include "akjet-app.volumes" (dict "root" $root "paths" $c.writablePaths) }}
+      volumes:
+        {{- . | nindent 8 }}
+      {{- end }}
+{{- end }}

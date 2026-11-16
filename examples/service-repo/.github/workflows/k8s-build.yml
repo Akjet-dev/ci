@@ -1,0 +1,64 @@
+# Template for a service repository: copy to .github/workflows/k8s-build.yml.
+# Kubernetes pipeline. It lives NEXT TO the existing deployment workflow and never touches it:
+# the branches below are different from the ones the existing workflow reacts to. Existing branches
+# (main, dev/v1, dev/v2, ...) never start this file; the prefix dev/ is not used for Kubernetes at all.
+#
+#   dev-k8s/release     test, validate, build, scan, publish, deploy to the DEV namespace (when enabled)
+#   stage-k8s/release   test, validate (stage values), build, scan, publish - NO deployment from this repository
+#   other dev-k8s/*     test, validate, build, scan - nothing is published or deployed
+#   other stage-k8s/*   the same, validated against the stage values
+#
+# Replace <CI_COMMIT> with the full commit SHA of the shared ci repository.
+name: K8s build
+
+on:
+  push:
+    branches:
+      - 'dev-k8s/**'
+      - 'stage-k8s/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the service test suite
+        run: make test            # service specific
+
+  validate:
+    name: Validate Helm values
+    uses: example-org/ci/.github/workflows/deploy-k8s.yml@<CI_COMMIT>
+    with:
+      environment: ${{ startsWith(github.ref_name, 'stage-k8s/') && 'stage' || 'dev' }}
+      validate-only: true
+      chart-version: 0.1.0
+
+  image:
+    name: Image
+    needs: [test, validate]
+    permissions:
+      contents: read
+      packages: write
+    uses: example-org/ci/.github/workflows/build-image.yml@<CI_COMMIT>
+    # Published only from dev-k8s/release and stage-k8s/release (enforced by the shared workflow as well).
+    with:
+      push: ${{ github.ref == 'refs/heads/dev-k8s/release' || github.ref == 'refs/heads/stage-k8s/release' }}
+
+  deploy-dev:
+    name: Deploy to DEV
+    needs: image
+    # Exactly one branch deploys, and only after the platform switched deployment on for this repository
+    # (repository variable K8S_DEV_DEPLOY_ENABLED = true). Both conditions are checked again inside the
+    # shared workflow.
+    if: github.ref == 'refs/heads/dev-k8s/release' && vars.K8S_DEV_DEPLOY_ENABLED == 'true'
+    uses: example-org/ci/.github/workflows/deploy-k8s.yml@<CI_COMMIT>
+    with:
+      environment: dev
+      image-digest: ${{ needs.image.outputs.digest }}
+      chart-version: 0.1.0

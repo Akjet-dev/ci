@@ -1,0 +1,448 @@
+name: Deploy to Kubernetes
+
+# Reusable workflow: validates the rendered manifests on a GitHub-hosted runner, then runs
+# `helm upgrade --install` from a self-hosted runner INSIDE the target cluster.
+#
+#   namespace = <environment>-<repository name>   computed here, never an input
+#   runner    = akjet-ds-apps                     fixed in this file (env RUNNER_LABEL), never an input
+#
+# What may be deployed from where is fixed in this file (step "Resolve and check the target"):
+#   dev    validation from any branch; deployment only from the branch dev-k8s/release, and only while
+#          the repository variable K8S_DEV_DEPLOY_ENABLED is "true"
+#   stage  validation only (validate-only: true); this workflow never deploys it
+#
+# The workflow receives no secrets and no kubeconfig: the in-cluster runner uses its own ServiceAccount
+# (arc-runners/app-deployer). akjet-ds-apps is ONE runner scale set shared by all application
+# repositories; on GitHub Free it sits in the organization Default runner group, so GitHub does not
+# restrict which repository reaches it. The enforced boundary is the cluster RBAC: the ServiceAccount
+# has only a namespaced Role in the application namespaces whose workloads are enabled.
+# Interface, runner contract and limitations: docs/workflows.md
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: '"dev", or "stage" together with validate-only'
+        type: string
+        required: true
+      validate-only:
+        description: Render and validate the manifests, do not deploy
+        type: boolean
+        default: false
+      image-digest:
+        description: Image digest to deploy, sha256:<64 hex> (output of build-image.yml); optional with validate-only
+        type: string
+        default: ''
+      chart-version:
+        description: Exact version of the shared chart
+        type: string
+        required: true
+      release:
+        description: Helm release name (default - the repository name)
+        type: string
+        default: ''
+      values-dir:
+        description: Directory with values.yaml and values-<environment>.yaml
+        type: string
+        default: 'deploy'
+      chart:
+        description: >-
+          Chart reference (default - oci://ghcr.io/<owner>/charts/akjet-app). A path starting with ./
+          selects a chart inside the calling repository.
+        type: string
+        default: ''
+      run-migrations:
+        description: Run the migration Job (values key "migration") before the upgrade
+        type: boolean
+        default: false
+      restart:
+        description: Restart all pods even if nothing else changed (after a Secret was updated)
+        type: boolean
+        default: false
+      timeout:
+        description: Timeout of the Helm upgrade and of the migration Job, e.g. 10m
+        type: string
+        default: '10m'
+      pod-logs-on-failure:
+        description: Print the last log lines of the release pods when the deployment fails
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  HELM_VERSION: '4.3.1'
+  HELM_SHA256: 0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
+  KUBECTL_VERSION: '1.35.10'
+  KUBECTL_SHA256: c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
+  KUBECONFORM_VERSION: '0.8.0'
+  KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+  KUBERNETES_VERSION: '1.35.6'
+  # Fixed parts of the contract with the platform; deliberately not inputs.
+  RUNNER_LABEL: akjet-ds-apps
+  DEV_DEPLOY_BRANCH: dev-k8s/release
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      namespace: ${{ steps.target.outputs.namespace }}
+      release: ${{ steps.target.outputs.release }}
+      runner: ${{ steps.target.outputs.runner }}
+      chart: ${{ steps.target.outputs.chart }}
+      digest: ${{ steps.target.outputs.digest }}
+      deploy: ${{ steps.target.outputs.deploy }}
+    steps:
+      - name: Resolve and check the target
+        id: target
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          DIGEST: ${{ inputs.image-digest }}
+          CHART_VERSION: ${{ inputs.chart-version }}
+          RELEASE_INPUT: ${{ inputs.release }}
+          VALUES_DIR: ${{ inputs.values-dir }}
+          CHART_INPUT: ${{ inputs.chart }}
+          TIMEOUT: ${{ inputs.timeout }}
+          VALIDATE_ONLY: ${{ inputs.validate-only }}
+          DEPLOY_ENABLED: ${{ vars.K8S_DEV_DEPLOY_ENABLED }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$1"; exit 1; }
+          label='^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+
+          # Explicit allow-list of what this workflow may do. It is changed here, in review, never by
+          # callers: there is no input for the namespace, the runner or the deployment branch.
+          deploy=false
+          case "${ENVIRONMENT}" in
+            dev)
+              if [ "${VALIDATE_ONLY}" != "true" ]; then
+                [ "${GITHUB_REF}" = "refs/heads/${DEV_DEPLOY_BRANCH}" ] \
+                  || die "deployment to dev is allowed only from the branch ${DEV_DEPLOY_BRANCH} (this run: ${GITHUB_REF})"
+                case "${GITHUB_EVENT_NAME}" in
+                  push|workflow_dispatch) ;;
+                  *) die "deployment is not allowed for the event '${GITHUB_EVENT_NAME}'" ;;
+                esac
+                deploy=true
+              fi ;;
+            stage)
+              [ "${VALIDATE_ONLY}" = "true" ] \
+                || die "this workflow only validates the stage configuration; stage is deployed by the platform-controlled dispatcher" ;;
+            *) die "environment '${ENVIRONMENT}' is not known to this workflow" ;;
+          esac
+
+          service="${GITHUB_REPOSITORY#*/}"
+          printf '%s' "${service}" | grep -Eq "${label}" \
+            || die "repository name '${service}' cannot be used as a namespace suffix (lower case letters, digits, '-')"
+          namespace="${ENVIRONMENT}-${service}"
+          [ "${#namespace}" -le 63 ] || die "namespace '${namespace}' is longer than 63 characters"
+
+          release="${RELEASE_INPUT:-${service}}"
+          printf '%s' "${release}" | grep -Eq "${label}" || die "release must match ${label}"
+          [ "${#release}" -le 40 ] || die "release is longer than 40 characters"
+
+          if [ "${VALIDATE_ONLY}" = "true" ] && [ -z "${DIGEST}" ]; then
+            # Validation does not need a real image: a placeholder digest keeps the schema satisfied.
+            DIGEST="sha256:$(printf '0%.0s' $(seq 1 64))"
+          fi
+          printf '%s' "${DIGEST}" | grep -Eq '^sha256:[a-f0-9]{64}$' \
+            || die "image-digest must be sha256:<64 hex>; tags are not accepted"
+          printf '%s' "${CHART_VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+            || die "chart-version must be an exact version, e.g. 1.2.3"
+          printf '%s' "${TIMEOUT}" | grep -Eq '^[0-9]{1,3}(s|m)$' || die "timeout must look like 300s or 10m"
+          case "${VALUES_DIR}" in
+            /*|*..*) die "values-dir must be a relative path inside the repository" ;;
+          esac
+
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          chart="${CHART_INPUT:-oci://ghcr.io/${owner}/charts/akjet-app}"
+          case "${chart}" in
+            oci://*) ;;
+            ./*) case "${chart}" in *..*) die "chart path must stay inside the repository" ;; esac ;;
+            *) die "chart must be an oci:// reference or a ./path inside the repository" ;;
+          esac
+
+          {
+            echo "namespace=${namespace}"
+            echo "release=${release}"
+            echo "runner=${RUNNER_LABEL}"
+            echo "chart=${chart}"
+            echo "digest=${DIGEST}"
+            echo "deploy=${deploy}"
+          } >> "${GITHUB_OUTPUT}"
+
+          if [ "${deploy}" = "true" ] && [ "${DEPLOY_ENABLED}" != "true" ]; then
+            echo "::notice::manifests are validated, but deployment is disabled: repository variable K8S_DEV_DEPLOY_ENABLED is not 'true'"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned tools
+        run: |
+          set -euo pipefail
+          bin="${RUNNER_TEMP}/bin"; mkdir -p "${bin}"; cd "${RUNNER_TEMP}"
+          curl -fsSLo helm.tgz "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm && mv linux-amd64/helm "${bin}/helm"
+          curl -fsSLo kubeconform.tgz "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tgz" | sha256sum -c -
+          tar -xzf kubeconform.tgz kubeconform && mv kubeconform "${bin}/kubeconform"
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      - name: Render
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          DIGEST: ${{ steps.target.outputs.digest }}
+          CHART_VERSION: ${{ inputs.chart-version }}
+          VALUES_DIR: ${{ inputs.values-dir }}
+          RUN_MIGRATIONS: ${{ inputs.run-migrations }}
+          NAMESPACE: ${{ steps.target.outputs.namespace }}
+          RELEASE: ${{ steps.target.outputs.release }}
+          CHART: ${{ steps.target.outputs.chart }}
+        run: |
+          set -euo pipefail
+          for f in "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"; do
+            test -f "${f}" || { echo "::error::values file not found: ${f}"; exit 1; }
+          done
+          case "${CHART}" in
+            oci://*)
+              helm pull "${CHART}" --version "${CHART_VERSION}" --untar --untardir "${RUNNER_TEMP}/chart"
+              chart_dir="$(find "${RUNNER_TEMP}/chart" -mindepth 1 -maxdepth 1 -type d | head -1)" ;;
+            *) chart_dir="${CHART}" ;;
+          esac
+          common=(
+            "${RELEASE}" "${chart_dir}" --namespace "${NAMESPACE}"
+            -f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"
+            --set-string "image.digest=${DIGEST}"
+          )
+          helm lint "${chart_dir}" "${common[@]:2}"
+          helm template "${common[@]}" --set migration.render=false > "${RUNNER_TEMP}/release.yaml"
+          cp "${RUNNER_TEMP}/release.yaml" "${RUNNER_TEMP}/all.yaml"
+          if [ "${RUN_MIGRATIONS}" = "true" ]; then
+            helm template "${common[@]}" --set migration.render=true --set-string migration.runId=validate \
+              --show-only templates/migration-job.yaml > "${RUNNER_TEMP}/migration.yaml" \
+              || { echo "::error::run-migrations is set, but the values do not enable 'migration'"; exit 1; }
+            cat "${RUNNER_TEMP}/migration.yaml" >> "${RUNNER_TEMP}/all.yaml"
+          fi
+
+      - name: Validate manifests
+        run: |
+          set -euo pipefail
+          kubeconform -strict -summary -kubernetes-version "${KUBERNETES_VERSION}" \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            "${RUNNER_TEMP}/all.yaml"
+
+          # The release may contain only namespaced workload objects, none of them placed explicitly.
+          # Routes (HTTPRoute) are owned by the platform (k8s-infra), never by an application release.
+          kinds="$(yq ea -N 'select(. != null) | .kind' "${RUNNER_TEMP}/all.yaml" | sort -u | tr '\n' ' ')"
+          echo "Rendered kinds: ${kinds}"
+          for kind in ${kinds}; do
+            case "${kind}" in
+              ConfigMap|ServiceAccount|Deployment|Service|Job) ;;
+              *) echo "::error::kind ${kind} must not be deployed by an application release"; exit 1 ;;
+            esac
+          done
+          if [ "$(yq ea -N '[select(. != null and .metadata.namespace != null)] | length' "${RUNNER_TEMP}/all.yaml" | sort -u | tail -1)" != "0" ]; then
+            echo "::error::manifests must not set metadata.namespace"; exit 1
+          fi
+          unpinned="$(yq ea -N '.spec.template.spec.containers[]?.image' "${RUNNER_TEMP}/all.yaml" | grep -Ev '@sha256:[a-f0-9]{64}$' || true)"
+          if [ -n "${unpinned}" ]; then
+            echo "::error::images must be pinned by digest: ${unpinned}"; exit 1
+          fi
+
+  deploy:
+    name: Deploy ${{ needs.validate.outputs.release }} to ${{ needs.validate.outputs.namespace }}
+    needs: validate
+    # Three independent conditions: the target check above allowed a deployment (dev, from
+    # dev-k8s/release), the caller did not ask for validation only, and deployment is switched on for
+    # the repository.
+    if: >-
+      needs.validate.outputs.deploy == 'true' && !inputs.validate-only
+      && inputs.environment == 'dev' && github.ref == 'refs/heads/dev-k8s/release'
+      && vars.K8S_DEV_DEPLOY_ENABLED == 'true'
+    # Shared self-hosted runner inside the cluster (ARC scale set akjet-ds-apps, env RUNNER_LABEL).
+    # It is available to every repository in the runner group; what the job can change is limited by
+    # the RBAC of its ServiceAccount (namespaced Role in enabled application namespaces only).
+    runs-on: ${{ needs.validate.outputs.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    # One Helm operation per release at a time; a running deployment is never cancelled.
+    concurrency:
+      group: deploy-k8s-${{ github.repository }}-dev-${{ needs.validate.outputs.release }}
+      cancel-in-progress: false
+
+    env:
+      # Release data is stored in ConfigMaps: the deployer needs no access to Secrets.
+      HELM_DRIVER: configmap
+      ENVIRONMENT: dev
+      DIGEST: ${{ needs.validate.outputs.digest }}
+      CHART_VERSION: ${{ inputs.chart-version }}
+      VALUES_DIR: ${{ inputs.values-dir }}
+      TIMEOUT: ${{ inputs.timeout }}
+      NAMESPACE: ${{ needs.validate.outputs.namespace }}
+      RELEASE: ${{ needs.validate.outputs.release }}
+      CHART: ${{ needs.validate.outputs.chart }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned tools
+        run: |
+          set -euo pipefail
+          bin="${RUNNER_TEMP}/bin"; mkdir -p "${bin}"; cd "${RUNNER_TEMP}"
+          curl -fsSLo helm.tgz "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm && mv linux-amd64/helm "${bin}/helm"
+          curl -fsSLo "${bin}/kubectl" "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  ${bin}/kubectl" | sha256sum -c -
+          chmod +x "${bin}/kubectl"
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      - name: Check the runner identity
+        run: |
+          set -euo pipefail
+          test -r /var/run/secrets/kubernetes.io/serviceaccount/token \
+            || { echo "::error::this job must run on a runner inside the cluster (no ServiceAccount token found)"; exit 1; }
+          if [ -n "${KUBECONFIG:-}" ] || [ -e "${HOME}/.kube/config" ]; then
+            echo "::error::a kubeconfig is present on the runner; only the pod ServiceAccount may be used"; exit 1
+          fi
+          for check in "create deployments.apps" "create configmaps" "create jobs.batch"; do
+            # shellcheck disable=SC2086
+            kubectl auth can-i ${check} --namespace "${NAMESPACE}" --quiet \
+              || { echo "::error::the runner ServiceAccount may not '${check}' in ${NAMESPACE}"; exit 1; }
+          done
+          if kubectl auth can-i get secrets --namespace "${NAMESPACE}" --quiet; then
+            echo "::warning::the runner ServiceAccount can read Secrets in ${NAMESPACE}; the deployer role should not allow that"
+          fi
+
+      - name: Fetch the chart
+        id: chart
+        run: |
+          set -euo pipefail
+          for f in "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"; do
+            test -f "${f}" || { echo "::error::values file not found: ${f}"; exit 1; }
+          done
+          case "${CHART}" in
+            oci://*)
+              helm pull "${CHART}" --version "${CHART_VERSION}" --untar --untardir "${RUNNER_TEMP}/chart"
+              echo "dir=$(find "${RUNNER_TEMP}/chart" -mindepth 1 -maxdepth 1 -type d | head -1)" >> "${GITHUB_OUTPUT}" ;;
+            *) echo "dir=${CHART}" >> "${GITHUB_OUTPUT}" ;;
+          esac
+
+      # The migration Job is created before the upgrade and is not part of the Helm release.
+      # A failed migration stops the deployment; the schema is never rolled back automatically.
+      - name: Run the migration Job
+        if: inputs.run-migrations
+        env:
+          CHART_DIR: ${{ steps.chart.outputs.dir }}
+        run: |
+          set -euo pipefail
+          run_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          helm template "${RELEASE}" "${CHART_DIR}" --namespace "${NAMESPACE}" \
+            -f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml" \
+            --set-string "image.digest=${DIGEST}" \
+            --set migration.render=true --set-string "migration.runId=${run_id}" \
+            --show-only templates/migration-job.yaml > "${RUNNER_TEMP}/migration.yaml"
+          job="${RELEASE}-migrate-${run_id}"
+          kubectl --namespace "${NAMESPACE}" create -f "${RUNNER_TEMP}/migration.yaml"
+
+          seconds="${TIMEOUT%[sm]}"; case "${TIMEOUT}" in *m) seconds=$((seconds * 60)) ;; esac
+          deadline=$(( $(date +%s) + seconds ))
+          result=timeout
+          while [ "$(date +%s)" -lt "${deadline}" ]; do
+            status="$(kubectl --namespace "${NAMESPACE}" get job "${job}" \
+              -o jsonpath='{.status.succeeded}/{.status.failed}')"
+            case "${status}" in
+              1/*) result=succeeded; break ;;
+              */[1-9]*) result=failed; break ;;
+            esac
+            sleep 5
+          done
+          echo "--- migration output (last 200 lines)"
+          kubectl --namespace "${NAMESPACE}" logs "job/${job}" --tail=200 || true
+          echo "### Migration Job \`${job}\`: ${result}" >> "${GITHUB_STEP_SUMMARY}"
+          [ "${result}" = "succeeded" ] || { echo "::error::migration Job ${job}: ${result}"; exit 1; }
+
+      - name: Helm upgrade
+        env:
+          CHART_DIR: ${{ steps.chart.outputs.dir }}
+          RESTART: ${{ inputs.restart }}
+        run: |
+          set -euo pipefail
+          args=(
+            upgrade --install "${RELEASE}" "${CHART_DIR}" --namespace "${NAMESPACE}"
+            -f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"
+            --set-string "image.digest=${DIGEST}"
+            --set migration.render=false
+            --rollback-on-failure --wait --timeout "${TIMEOUT}" --history-max 20
+            --description "commit ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
+          )
+          if [ "${RESTART}" = "true" ]; then
+            args+=(--set-string "rolloutRevision=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
+          fi
+          helm "${args[@]}"
+
+      - name: Verify the rollout
+        run: |
+          set -euo pipefail
+          kubectl --namespace "${NAMESPACE}" rollout status deployment \
+            --selector "app.kubernetes.io/instance=${RELEASE}" --timeout=120s
+          kubectl --namespace "${NAMESPACE}" get deployments \
+            --selector "app.kubernetes.io/instance=${RELEASE}" \
+            -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,WANTED:.spec.replicas,IMAGE:.spec.template.spec.containers[0].image'
+
+      # Diagnostics never print Secret objects, pod specifications or environment variables.
+      - name: Diagnostics
+        if: failure()
+        env:
+          POD_LOGS: ${{ inputs.pod-logs-on-failure }}
+        run: |
+          set +e
+          sel="app.kubernetes.io/instance=${RELEASE}"
+          echo "--- helm history"
+          helm history "${RELEASE}" --namespace "${NAMESPACE}" --max 5
+          echo "--- workloads"
+          kubectl --namespace "${NAMESPACE}" get deployments,replicasets,pods,jobs --selector "${sel}" -o wide
+          echo "--- container states"
+          kubectl --namespace "${NAMESPACE}" get pods --selector "${sel}" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{range .status.containerStatuses[*]}{.name}{" restarts="}{.restartCount}{" waiting="}{.state.waiting.reason}{" terminated="}{.state.terminated.reason}{" exit="}{.state.terminated.exitCode}{"  "}{end}{"\n"}{end}'
+          echo "--- events (last 40)"
+          kubectl --namespace "${NAMESPACE}" get events --sort-by=.lastTimestamp \
+            -o custom-columns='TIME:.lastTimestamp,TYPE:.type,REASON:.reason,OBJECT:.involvedObject.name,MESSAGE:.message' | tail -40
+          if [ "${POD_LOGS}" = "true" ]; then
+            for pod in $(kubectl --namespace "${NAMESPACE}" get pods --selector "${sel}" -o name); do
+              echo "--- logs ${pod} (last 50 lines)"
+              kubectl --namespace "${NAMESPACE}" logs "${pod}" --all-containers --tail=50
+            done
+          fi
+          exit 0
+
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### Deployment: ${JOB_STATUS}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Release | \`${RELEASE}\` |"
+            echo "| Namespace | \`${NAMESPACE}\` |"
+            echo "| Image digest | \`${DIGEST}\` |"
+            echo "| Chart | \`${CHART}\` ${CHART_VERSION} |"
+            echo "| Values commit | \`${GITHUB_SHA}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"

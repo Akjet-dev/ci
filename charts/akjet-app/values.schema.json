@@ -1,0 +1,286 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "akjet-app values",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "components"],
+  "definitions": {
+    "name": { "type": "string", "pattern": "^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$" },
+    "portName": { "type": "string", "pattern": "^[a-z]([a-z0-9-]{0,13}[a-z0-9])?$" },
+    "envName": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "absolutePath": { "type": "string", "pattern": "^/[^\\s]*[^\\s/]$" },
+    "quantity": { "type": ["string", "integer"], "pattern": "^[0-9]+(\\.[0-9]+)?(m|k|Ki|M|Mi|G|Gi)?$" },
+    "stringList": { "type": "array", "items": { "type": "string" } },
+    "plainEnv": {
+      "description": "Non-secret variables. Names that look like credentials are rejected: put them into a Secret.",
+      "type": "object",
+      "propertyNames": {
+        "allOf": [
+          { "$ref": "#/definitions/envName" },
+          { "not": { "pattern": "(?i)(PASSWORD|PASSWD|SECRET|TOKEN|ACCESS_KEY|(^|_)KEY$)" } }
+        ]
+      },
+      "additionalProperties": { "type": "string" }
+    },
+    "secretList": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/name" } },
+    "secretEnv": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/definitions/envName" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["secret", "key"],
+        "properties": {
+          "secret": { "$ref": "#/definitions/name" },
+          "key": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+        }
+      }
+    },
+    "writablePaths": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/absolutePath" } },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": { "$ref": "#/definitions/quantity" },
+            "memory": { "$ref": "#/definitions/quantity" },
+            "ephemeral-storage": { "$ref": "#/definitions/quantity" }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["memory"],
+          "properties": {
+            "cpu": { "$ref": "#/definitions/quantity" },
+            "memory": { "$ref": "#/definitions/quantity" },
+            "ephemeral-storage": { "$ref": "#/definitions/quantity" }
+          }
+        }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "port": { "$ref": "#/definitions/portName" },
+        "exec": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 },
+        "successThreshold": { "type": "integer", "minimum": 1 }
+      },
+      "oneOf": [
+        { "required": ["path", "port"], "not": { "required": ["exec"] } },
+        { "required": ["exec"], "not": { "anyOf": [{ "required": ["path"] }, { "required": ["port"] }] } }
+      ]
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resources"],
+      "properties": {
+        "replicas": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "command": { "$ref": "#/definitions/stringList" },
+        "args": { "$ref": "#/definitions/stringList" },
+        "ports": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/definitions/portName" },
+          "additionalProperties": { "type": "integer", "minimum": 1024, "maximum": 65535 }
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "strategy": { "enum": ["RollingUpdate", "Recreate"] },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "probes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "startup": { "$ref": "#/definitions/probe" },
+            "readiness": { "$ref": "#/definitions/probe" },
+            "liveness": { "$ref": "#/definitions/probe" }
+          }
+        },
+        "resources": { "$ref": "#/definitions/resources" },
+        "writablePaths": { "$ref": "#/definitions/writablePaths" },
+        "config": { "$ref": "#/definitions/plainEnv" },
+        "envFromSecrets": { "$ref": "#/definitions/secretList" },
+        "secretEnv": { "$ref": "#/definitions/secretEnv" }
+      },
+      "if": { "required": ["strategy"], "properties": { "strategy": { "const": "Recreate" } } },
+      "then": { "properties": { "replicas": { "maximum": 1 } } }
+    }
+  },
+  "properties": {
+    "global": { "type": "object" },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "digest"],
+      "properties": {
+        "repository": {
+          "description": "Registry path without tag or digest.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)+$"
+        },
+        "digest": {
+          "description": "Immutable image reference. Tags are not accepted.",
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "pullPolicy": { "enum": ["IfNotPresent", "Always"] }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$" }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" }
+      }
+    },
+    "podSecurity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "runAsUser": { "type": "integer", "minimum": 1 },
+        "runAsGroup": { "type": "integer", "minimum": 1 },
+        "fsGroup": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "readOnlyRootFilesystem": { "type": "boolean" },
+    "config": { "$ref": "#/definitions/plainEnv" },
+    "requiredSecrets": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/definitions/name" },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+      }
+    },
+    "envFromSecrets": { "$ref": "#/definitions/secretList" },
+    "secretEnv": { "$ref": "#/definitions/secretEnv" },
+    "secretFiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["secret", "key", "mountPath"],
+        "properties": {
+          "secret": { "$ref": "#/definitions/name" },
+          "key": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+          "mountPath": { "$ref": "#/definitions/absolutePath" }
+        }
+      }
+    },
+    "components": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/definitions/name" },
+      "additionalProperties": { "$ref": "#/definitions/component" }
+    },
+    "httpRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "parentRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "namespace": { "type": "string", "minLength": 1 },
+            "sectionName": { "type": "string", "minLength": 1 }
+          }
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["component", "hostnames"],
+            "properties": {
+              "name": { "$ref": "#/definitions/name" },
+              "component": { "$ref": "#/definitions/name" },
+              "port": { "$ref": "#/definitions/portName" },
+              "hostnames": {
+                "description": "Explicit hostnames only: no wildcards, no empty list.",
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+                }
+              },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["value"],
+                  "properties": {
+                    "type": { "enum": ["PathPrefix", "Exact"] },
+                    "value": { "type": "string", "pattern": "^/" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "if": { "properties": { "enabled": { "const": true } } },
+      "then": {
+        "required": ["parentRef", "routes"],
+        "properties": {
+          "parentRef": { "required": ["name", "namespace"] },
+          "routes": { "minItems": 1 }
+        }
+      }
+    },
+    "migration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "render": { "type": "boolean" },
+        "runId": { "type": "string", "pattern": "^([a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?)?$" },
+        "command": { "$ref": "#/definitions/stringList" },
+        "args": { "$ref": "#/definitions/stringList" },
+        "config": { "$ref": "#/definitions/plainEnv" },
+        "envFromSecrets": { "$ref": "#/definitions/secretList" },
+        "secretEnv": { "$ref": "#/definitions/secretEnv" },
+        "writablePaths": { "$ref": "#/definitions/writablePaths" },
+        "activeDeadlineSeconds": { "type": "integer", "minimum": 30, "maximum": 7200 },
+        "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
+        "resources": { "$ref": "#/definitions/resources" }
+      },
+      "if": { "properties": { "enabled": { "const": true } } },
+      "then": {
+        "required": ["command", "resources"],
+        "properties": { "command": { "minItems": 1 } }
+      }
+    },
+    "rolloutRevision": { "type": "string", "pattern": "^[A-Za-z0-9._-]{0,63}$" }
+  }
+}

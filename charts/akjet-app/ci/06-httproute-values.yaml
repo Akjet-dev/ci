@@ -1,0 +1,30 @@
+# HTTPRoute enabled explicitly, with an explicit hostname and parent Gateway listener.
+image:
+  repository: ghcr.io/example-org/example-web
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+components:
+  web:
+    ports: { http: 8080 }
+    service: { enabled: true }
+    probes:
+      readiness: { path: /healthz, port: http }
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+    writablePaths: [/tmp]
+httpRoute:
+  enabled: true
+  parentRef:
+    name: example-gateway
+    namespace: example-gateways
+    sectionName: http-dev
+  routes:
+    - component: web
+      hostnames: [app.example.test]
+    - name: api
+      component: web
+      port: http
+      hostnames: [app.example.test]
+      paths:
+        - { type: PathPrefix, value: /api }
+        - { type: Exact, value: /status }

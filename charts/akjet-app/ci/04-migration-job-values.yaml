@@ -1,0 +1,33 @@
+# Migration Job rendered on request (the deploy workflow sets render and runId). Uses its own DB role.
+image:
+  repository: ghcr.io/example-org/example-api
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+imagePullSecrets: [registry-pull]
+config:
+  APP_ENV: dev
+  DB_CONNECTION: pgsql
+  DB_HOST: postgres.example.test
+  DB_DATABASE: example_dev
+  DB_USERNAME: example_dev_app
+requiredSecrets:
+  app: [APP_KEY, DB_PASSWORD]
+  migrate: [DB_PASSWORD]
+envFromSecrets: [app]
+components:
+  web:
+    ports: { http: 8080 }
+    service: { enabled: true }
+    resources:
+      requests: { cpu: 100m, memory: 192Mi }
+      limits: { memory: 384Mi }
+migration:
+  enabled: true
+  render: true
+  runId: "1234567890-1"
+  command: ["php", "artisan", "migrate", "--force"]
+  config:
+    DB_USERNAME: example_dev_migrator
+  envFromSecrets: [migrate]
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }

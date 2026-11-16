@@ -1,0 +1,40 @@
+{{- include "akjet-app.validate" . -}}
+{{- if .Values.httpRoute.enabled }}
+{{- $root := . }}
+{{- range $i, $r := .Values.httpRoute.routes }}
+{{- $c := get $root.Values.components $r.component }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ printf "%s-%s" (include "akjet-app.fullname" $root) ($r.name | default (printf "%s-%d" $r.component $i)) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "akjet-app.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $r.component }}
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $root.Values.httpRoute.parentRef.name }}
+      namespace: {{ $root.Values.httpRoute.parentRef.namespace }}
+      {{- with $root.Values.httpRoute.parentRef.sectionName }}
+      sectionName: {{ . }}
+      {{- end }}
+  hostnames:
+    {{- range $r.hostnames }}
+    - {{ . | quote }}
+    {{- end }}
+  rules:
+    - matches:
+        {{- range $r.paths | default (list (dict "type" "PathPrefix" "value" "/")) }}
+        - path:
+            type: {{ .type | default "PathPrefix" }}
+            value: {{ .value | quote }}
+        {{- end }}
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: {{ include "akjet-app.componentName" (dict "root" $root "component" $r.component) }}
+          port: {{ get $c.ports ($r.port | default "http") }}
+{{- end }}
+{{- end }}
