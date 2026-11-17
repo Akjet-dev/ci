@@ -176,10 +176,11 @@ case " $inputs " in
   *" namespace "*|*runner*|*" branch "*|*" service "*|*" kubeconfig "*|*" cluster "*) fail "deploy-k8s.yml exposes an input that selects the target: $inputs" ;;
   *) pass "no input selects the namespace, the runner, the cluster or the deployment branch ($inputs)" ;;
 esac
-if [ "$(yq '.on.workflow_call.secrets // {} | length' "$dk")" = "0" ]; then
-  pass "deploy-k8s.yml accepts no secrets"
+if [ "$(yq '.on.workflow_call.secrets // {} | keys | join(",")' "$dk")" = "app-secrets" ] \
+   && [ "$(yq '.on.workflow_call.secrets.app-secrets.required' "$dk")" = "false" ]; then
+  pass "deploy-k8s.yml accepts exactly one secret, the optional app-secrets"
 else
-  fail "deploy-k8s.yml must not accept secrets"
+  fail "deploy-k8s.yml: secrets contract"
 fi
 deploy_if="$(yq '.jobs.deploy.if' "$dk" | tr '\n' ' ')"
 ok_if=true
@@ -222,7 +223,7 @@ else
   fail "allowed kinds in deploy-k8s.yml: '$kinds_case'"
 fi
 good_digest="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-# environment ref event validate-only [digest] [release] [values-dir] [chart] [repository] [chart-version]
+# environment ref event validate-only [digest] [release] [values-dir] [chart] [repository] [chart-version] [app-secrets supplied]
 run_resolve() {
   : >"$WORK/gh_output"
   local repo="${9:-Example-Org/example-api}"
@@ -230,6 +231,7 @@ run_resolve() {
     RUNNER_LABEL="$runner_label" DEV_DEPLOY_BRANCH="$deploy_branch" \
     ENVIRONMENT="$1" GITHUB_REF="$2" GITHUB_EVENT_NAME="$3" VALIDATE_ONLY="$4" DIGEST="${5-$good_digest}" \
     RELEASE_INPUT="${6:-}" VALUES_DIR="${7:-deploy}" CHART_INPUT="${8:-}" CHART_VERSION="${10:-1.2.3}" \
+    APP_SECRETS_SUPPLIED="${11:-false}" \
     TIMEOUT="10m" DEPLOY_ENABLED="true" bash -c "$resolve" >"$WORK/resolve.log" 2>&1
 }
 out() { grep -qx "$1" "$WORK/gh_output"; }
@@ -281,6 +283,50 @@ reject "release with shell metacharacters" dev refs/heads/dev-k8s/release push f
 reject "values-dir outside the repository" dev refs/heads/dev-k8s/release push false "$good_digest" "" ../other
 reject "chart from an arbitrary URL" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy https://example.test/chart.tgz
 reject "repository name unusable as namespace" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy "" Example-Org/Example_API
+
+echo "== deploy-k8s.yml: namespaces shared by several repositories"
+rel=(dev refs/heads/dev-k8s/release push false "$good_digest")
+accept "backend deploys to the shared namespace dev-lk-backend" "namespace=dev-lk-backend" "${rel[@]}" "" deploy "" Akjet-dev/backend
+if out "release=backend"; then pass "backend keeps its own release name"; else fail "release of backend"; cat "$WORK/gh_output"; fi
+accept "lk-frontend deploys to the same namespace dev-lk-backend" "namespace=dev-lk-backend" "${rel[@]}" "" deploy "" Akjet-dev/lk-frontend
+if out "release=lk-frontend"; then pass "lk-frontend keeps its own release name"; else fail "release of lk-frontend"; cat "$WORK/gh_output"; fi
+accept "backend: stage values are validated for stage-lk-backend" "namespace=stage-lk-backend" stage refs/heads/stage-k8s/release push true "" "" deploy "" Akjet-dev/backend
+accept "lk-frontend: stage values are validated for stage-lk-backend" "namespace=stage-lk-backend" stage refs/heads/stage-k8s/release push true "" "" deploy "" Akjet-dev/lk-frontend
+accept "shared namespace: a second release of the same repository is allowed" "release=backend-tools" "${rel[@]}" backend-tools deploy "" Akjet-dev/backend
+reject "shared namespace: lk-frontend cannot manage the release 'backend'" "${rel[@]}" backend deploy "" Akjet-dev/lk-frontend
+reject "shared namespace: backend cannot manage the release 'lk-frontend'" "${rel[@]}" lk-frontend deploy "" Akjet-dev/backend
+reject "shared namespace: backend cannot manage an arbitrary release name" "${rel[@]}" satellite deploy "" Akjet-dev/backend
+for other in executor-frontend landing bcc-kommo-api; do
+  accept "$other keeps its own namespace dev-$other" "namespace=dev-$other" "${rel[@]}" "" deploy "" "Akjet-dev/$other"
+  accept "$other keeps its own namespace stage-$other" "namespace=stage-$other" stage refs/heads/stage-k8s/release push true "" "" deploy "" "Akjet-dev/$other"
+done
+# Two releases in one namespace: no object of one release may carry the name of an object of the other.
+"$HELM" template backend "$CHART" --namespace dev-lk-backend -f tests/secrets/deploy/values.yaml -f tests/secrets/deploy/values-dev.yaml >"$WORK/shared-a.yaml"
+"$HELM" template lk-frontend "$CHART" --namespace dev-lk-backend -f tests/overrides/deploy/values.yaml -f tests/overrides/deploy/values-dev.yaml >"$WORK/shared-b.yaml"
+objs() { yq ea -N 'select(. != null) | .kind + "/" + .metadata.name' "$1" | sort; }
+if [ -z "$(comm -12 <(objs "$WORK/shared-a.yaml") <(objs "$WORK/shared-b.yaml"))" ] \
+   && ! objs "$WORK/shared-a.yaml" | grep -qv '/backend\(-\|$\)' && ! objs "$WORK/shared-b.yaml" | grep -qv '/lk-frontend\(-\|$\)'; then
+  pass "two releases in one namespace: every object name starts with its release name, none is shared"
+else
+  fail "two releases in one namespace share an object name"; objs "$WORK/shared-a.yaml"; objs "$WORK/shared-b.yaml"
+fi
+sel_of() { yq ea -N -o=json -I0 'select(.kind == "Deployment" or .kind == "Service") | (.spec.selector.matchLabels // .spec.selector)' "$1" | sort -u; }
+if ! sel_of "$WORK/shared-a.yaml" | grep -qv '"app.kubernetes.io/instance":"backend"' \
+   && ! sel_of "$WORK/shared-b.yaml" | grep -qv '"app.kubernetes.io/instance":"lk-frontend"'; then
+  pass "two releases in one namespace: every Deployment and Service selects pods of its own release only"
+else
+  fail "selectors do not include the release"; sel_of "$WORK/shared-a.yaml"; sel_of "$WORK/shared-b.yaml"
+fi
+# shellcheck disable=SC2016  # literal workflow text
+if [ "$(grep -c -- '--selector "app.kubernetes.io/instance=${RELEASE}"' "$dk")" = "2" ] \
+   && [ "$(grep -c 'sel="app.kubernetes.io/instance=${RELEASE}"' "$dk")" = "1" ]; then
+  pass "rollout check and diagnostics look only at objects of the deployed release"
+else
+  fail "rollout check / diagnostics are not limited to the release"
+fi
+reject "app-secrets passed to a validation-only run" dev refs/heads/dev-k8s/feature-x push true "" "" deploy "" Akjet-dev/backend "" true
+reject "app-secrets passed to stage validation" stage refs/heads/stage-k8s/release push true "" "" deploy "" Akjet-dev/backend "" true
+accept "app-secrets passed to the deploying run" "deploy=true" "${rel[@]}" "" deploy "" Akjet-dev/backend "" true
 
 echo "== deploy-k8s.yml: private chart registry"
 for job in validate deploy; do
@@ -542,6 +588,178 @@ if [ "$(render_ov dev | yq 'select(.kind == "Deployment") | .spec.template.spec.
 else
   fail "overrides changed the image or the Secret references"
 fi
+
+echo "== deploy-k8s.yml: GitHub secrets -> Kubernetes Secrets (app-secrets)"
+sec_src=tests/secrets
+decl_step="$(yq '.jobs.validate.steps[] | select(.id == "declared") | .run' "$dk")"
+declared() {  # environment -> list
+  : >"$WORK/decl_output"
+  ( cd "$sec_src" && env -i PATH="$PATH" GITHUB_OUTPUT="$WORK/decl_output" ENVIRONMENT="$1" VALUES_DIR=deploy bash -c "$decl_step" ) >"$WORK/decl.log" 2>&1 \
+    && sed -n 's/^list=//p' "$WORK/decl_output"
+}
+dev_declared="$(declared dev)"
+if [ "$dev_declared" = "app.APP_KEY app.DB_PASSWORD migrate.DB_PASSWORD" ]; then
+  pass "declared Secret keys of dev come from requiredSecrets ($dev_declared)"
+else
+  fail "declared Secret keys of dev: '$dev_declared'"; cat "$WORK/decl.log"
+fi
+if [ "$(declared stage)" = "app.APP_KEY app.DB_PASSWORD app.AWS_ACCESS_KEY_ID app.AWS_SECRET_ACCESS_KEY migrate.DB_PASSWORD integrations.PARTNER_API_TOKEN" ]; then
+  pass "declared Secret keys follow Helm precedence: the environment file replaces a list and adds a Secret"
+else
+  fail "declared Secret keys of stage: '$(declared stage)'"
+fi
+# shellcheck disable=SC2016  # literal workflow text
+if [ "$(yq '.jobs.validate.outputs.declared-secrets' "$dk")" = '${{ steps.declared.outputs.list }}' ] \
+   && [ "$(yq '.jobs.deploy.steps[] | select(.id == "secrets") | .env.DECLARED' "$dk")" = '${{ needs.validate.outputs.declared-secrets }}' ]; then
+  pass "the deploy job receives the declared keys from the validate job (names only)"
+else
+  fail "hand-over of the declared Secret keys"
+fi
+# shellcheck disable=SC2016  # literal workflow text
+if [ "$(grep -c 'secrets\.app-secrets' "$dk")" = "2" ] \
+   && [ "$(yq '.jobs.validate.steps[0].env.APP_SECRETS_SUPPLIED' "$dk")" = '${{ secrets.app-secrets != '"''"' }}' ] \
+   && [ "$(yq '[.jobs.deploy.steps[] | select(.env.APP_SECRETS != null)] | length' "$dk")" = "1" ] \
+   && [ "$(yq '[.jobs.validate.steps[] | select(.env.APP_SECRETS != null)] | length' "$dk")" = "0" ]; then
+  pass "secret values reach exactly one step of the deploy job; the validate job only learns whether they were passed"
+else
+  fail "where app-secrets is referenced"
+fi
+sec_step="$(yq '.jobs.deploy.steps[] | select(.id == "secrets") | .run' "$dk")"
+if grep -qE 'GITHUB_STEP_SUMMARY|set -x|tee |> *"\$\{RUNNER_TEMP' <<<"$sec_step"; then
+  fail "the Secret step writes to the summary, a file or a trace"
+else
+  pass "the Secret step writes nothing to the summary or to files and has no command trace"
+fi
+
+# A stand-in for kubectl: Secret objects are files in $FAKE_STATE (<name>.json = data, <name>.rv = resourceVersion).
+fakebin="$WORK/fakebin"; mkdir -p "$fakebin"
+cat >"$fakebin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "kubectl $*" >>"$FAKE_STATE/calls.log"
+case "$*" in
+  "auth can-i "*)
+    obj="$4"; verb="$3"
+    case " ${FAKE_DENY:-} " in *" ${verb}:${obj#secret/} "*) exit 1 ;; esac
+    exit 0 ;;
+  *" get secret "*)
+    name="$5"; test -f "$FAKE_STATE/$name.rv" || { echo "Error from server (NotFound)" >&2; exit 1; }
+    cat "$FAKE_STATE/$name.rv" ;;
+  *" apply --server-side --field-manager=akjet-app-secrets --force-conflicts -f -")
+    doc="$(cat)"; name="$(jq -r '.metadata.name' <<<"$doc")"
+    [ "$(jq -r '.kind + "/" + .apiVersion' <<<"$doc")" = "Secret/v1" ] || exit 1
+    test -f "$FAKE_STATE/$name.rv" || { echo "forbidden: cannot create" >&2; exit 1; }
+    new="$(jq -cS '.data' <<<"$doc")"
+    if [ "$new" != "$(cat "$FAKE_STATE/$name.json" 2>/dev/null)" ]; then
+      printf '%s' "$new" >"$FAKE_STATE/$name.json"; echo $(( $(cat "$FAKE_STATE/$name.rv") + 1 )) >"$FAKE_STATE/$name.rv"
+    fi
+    echo "secret/$name serverside-applied" ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+FAKE
+chmod +x "$fakebin/kubectl"
+sec_state="$WORK/sec-state"
+sec_reset() { rm -rf "$sec_state"; mkdir -p "$sec_state"; for n in "$@"; do echo 1 >"$sec_state/$n.rv"; done; : >"$sec_state/calls.log"; }
+provision() {  # app-secrets text, [declared list], [denied "verb:name ..."]
+  : >"$WORK/sec_output"
+  env -i PATH="$fakebin:$PATH" GITHUB_OUTPUT="$WORK/sec_output" RUNNER_TEMP="$WORK" FAKE_STATE="$sec_state" FAKE_DENY="${3:-}" \
+    NAMESPACE=dev-example-api RELEASE=example-api VALUES_DIR=deploy ENVIRONMENT=dev \
+    APP_SECRETS="$1" DECLARED="${2-$dev_declared}" bash --noprofile --norc -c "$sec_step" </dev/null >"$WORK/sec.log" 2>&1
+}
+sec_data() { jq -r --arg k "$2" '.[$k] // "" | @base64d' "$sec_state/$1.json" 2>/dev/null; }
+sec_reject() {  # label, expected text, provision args...
+  local label="$1" text="$2"; shift 2
+  if provision "$@"; then fail "accepted: $label"
+  elif ! grep -qF -- "$text" "$WORK/sec.log"; then fail "rejected for another reason: $label"; cat "$WORK/sec.log"
+  elif grep -q ' apply ' "$sec_state/calls.log"; then fail "$label: a Secret was written before the failure"
+  else pass "rejected, nothing written: $label"; fi
+}
+
+sec_reset example-api-app example-api-migrate
+if provision "" && [ "$(cat "$WORK/sec_output")" = "changed=false" ] && [ ! -s "$sec_state/calls.log" ]; then
+  pass "no app-secrets: the cluster is not contacted and Secrets stay as they are"
+else
+  fail "empty app-secrets"; cat "$WORK/sec.log"
+fi
+# shellcheck disable=SC2016  # a literal value with shell metacharacters, on purpose
+pw='p@ss w0rd=with/=signs+"quotes"$HOME'
+mig='M1gr@tor-0nly'
+mapping="$(printf 'app.DB_PASSWORD=%s\nmigrate.DB_PASSWORD=%s\napp.APP_KEY?=\n' "$pw" "$mig")"
+if provision "$mapping" && [ "$(sec_data example-api-app DB_PASSWORD)" = "$pw" ] && [ "$(sec_data example-api-migrate DB_PASSWORD)" = "$mig" ] \
+   && [ "$(jq -c 'keys' "$sec_state/example-api-app.json")" = '["DB_PASSWORD"]' ] && [ "$(cat "$WORK/sec_output")" = "changed=true" ]; then
+  pass "mapped values are written to the declared keys of <release>-<secret>, byte for byte; separate application and migration passwords"
+else
+  fail "provisioning of mapped values"; grep -v 'add-mask' "$WORK/sec.log"; cat "$sec_state/calls.log"
+fi
+if grep -qF 'Skipped (optional, not set): app.APP_KEY' "$WORK/sec.log"; then
+  pass "an optional key (?=) with an empty value is skipped and its key is not touched"
+else
+  fail "optional key handling"; grep -v 'add-mask' "$WORK/sec.log"
+fi
+if [ "$(grep -cF -- "$pw" "$WORK/sec.log")" = "1" ] && grep -qF -- "::add-mask::$pw" "$WORK/sec.log" \
+   && [ "$(grep -cF -- "$mig" "$WORK/sec.log")" = "1" ] && grep -qF -- "::add-mask::$mig" "$WORK/sec.log" \
+   && ! grep -qF -- "$pw" "$WORK/sec_output" "$sec_state/calls.log" && ! grep -rqF -- "$pw" "$WORK"/*.json 2>/dev/null \
+   && ! grep -qF "$(printf '%s' "$pw" | base64 | tr -d '\n')" "$WORK/sec.log" "$WORK/sec_output" "$sec_state/calls.log"; then
+  pass "a value appears only in its masking command: not in the log, the output, a command line or a file"
+else
+  fail "a secret value leaked"; grep -v 'add-mask' "$WORK/sec.log"
+fi
+if [ "$(grep -c '^::add-mask::' "$WORK/sec.log")" = "2" ] && [ "$(grep -n -m1 ' apply ' "$sec_state/calls.log" | cut -d: -f1)" -gt "$(grep -c 'auth can-i' "$sec_state/calls.log")" ]; then
+  pass "every value is masked, and all permissions are checked before the first write"
+else
+  fail "masking / order of permission checks"; cat "$sec_state/calls.log"
+fi
+if provision "$mapping" && [ "$(cat "$WORK/sec_output")" = "changed=false" ]; then
+  pass "unchanged values: the Secrets are not modified and no restart is requested"
+else
+  fail "second run with the same values"; cat "$WORK/sec_output"
+fi
+if provision "$(printf 'app.DB_PASSWORD=%s\n' 'rotated')" && [ "$(cat "$WORK/sec_output")" = "changed=true" ] && [ "$(sec_data example-api-app DB_PASSWORD)" = "rotated" ]; then
+  pass "a rotated value updates the Secret and requests a restart of the pods"
+else
+  fail "rotation"
+fi
+# shellcheck disable=SC2016  # literal workflow text
+if [ "$(yq '.jobs.deploy.steps[] | select(.name == "Helm upgrade") | .env.SECRETS_CHANGED' "$dk")" = '${{ steps.secrets.outputs.changed }}' ] \
+   && grep -qF 'if [ "${RESTART}" = "true" ] || [ "${SECRETS_CHANGED}" = "true" ]; then' "$dk"; then
+  pass "helm upgrade rolls the pods when a Secret changed"
+else
+  fail "restart after a Secret change"
+fi
+steps_order="$(yq '[.jobs.deploy.steps[].name] | join("|")' "$dk")"
+case "$steps_order" in
+  *"Provision application Secrets|Run the migration Job|Helm upgrade"*) pass "Secrets are provisioned before the migration Job and the upgrade" ;;
+  *) fail "order of the deploy steps: $steps_order" ;;
+esac
+
+sec_reset example-api-app example-api-migrate
+sec_reject "a required value that is not set (missing repository secret)" "no value for: app.DB_PASSWORD" "$(printf 'migrate.DB_PASSWORD=x\napp.DB_PASSWORD=\n')"
+sec_reject "a key that the values do not declare" "app.STRIPE_KEY is not declared in requiredSecrets" "app.STRIPE_KEY=x"
+sec_reject "a Secret that the values do not declare" "other.DB_PASSWORD is not declared in requiredSecrets" "other.DB_PASSWORD=x"
+sec_reject "a key declared only for stage (dev run)" "app.AWS_ACCESS_KEY_ID is not declared in requiredSecrets" "app.AWS_ACCESS_KEY_ID=x"
+sec_reject "a line without '='" "every line must be <secret>.<KEY>=<value>" "app.DB_PASSWORD"
+sec_reject "a line that does not name <secret>.<KEY>" "does not start with <secret>.<KEY>" "DB_PASSWORD=x"
+sec_reject "a name with shell or JSON metacharacters" "does not start with <secret>.<KEY>" 'app.DB"PASSWORD=x'
+sec_reject "the same key twice" "app.DB_PASSWORD is listed twice" "$(printf 'app.DB_PASSWORD=a\napp.DB_PASSWORD=b\n')"
+sec_reject "nothing declared at all" "is not declared in requiredSecrets" "app.DB_PASSWORD=x" ""
+sec_reject "the runner may not patch one of the Secrets" "may not patch Secret example-api-migrate" "$mapping" "$dev_declared" "patch:example-api-migrate"
+sec_reject "the runner may not read back one of the Secrets" "may not get Secret example-api-app" "$mapping" "$dev_declared" "get:example-api-app"
+if provision "app.DB_PASSWORD=super-secret-line" "$dev_declared" "patch:example-api-app" || ! grep -q 'super-secret-line' <(grep -v '^::add-mask::' "$WORK/sec.log"); then
+  pass "error messages never repeat a value"
+else
+  fail "an error message contains a value"
+fi
+sec_reset example-api-app
+sec_reject "a Secret object the platform has not created" "Secret example-api-migrate does not exist" "$(printf 'migrate.DB_PASSWORD=x\n')"
+if grep -q 'create' <<<"$sec_step" && ! grep -qE 'kubectl[^|]* create|can-i "?create' <<<"$sec_step"; then
+  pass "the Secret step never creates Secret objects"
+else
+  fail "the Secret step must not create Secret objects"
+fi
+for tpl in "${templates[@]}"; do
+  if grep -qE 'secrets: *inherit' "$tpl"; then fail "$tpl uses secrets: inherit"; fi
+done
+pass "no template passes secrets wholesale (secrets: inherit)"
 
 echo "== branch model: Kubernetes workflows next to the existing deployment"
 bm="$WORK/branch-model"; mkdir -p "$bm/ok"

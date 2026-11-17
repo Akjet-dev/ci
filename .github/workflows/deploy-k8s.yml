@@ -3,7 +3,9 @@ name: Deploy to Kubernetes
 # Reusable workflow: validates the rendered manifests on a GitHub-hosted runner, then runs
 # `helm upgrade --install` from a self-hosted runner INSIDE the target cluster.
 #
-#   namespace = <environment>-<repository name>   computed here, never an input
+#   namespace = <environment>-<repository name>   computed here, never an input. Repositories that the platform
+#               places together share <environment>-<group>; the groups are fixed in this file (step
+#               "Resolve and check the target") and mirror k8s-infra namespaces/*.yaml
 #   runner    = akjet-ds-apps                     fixed in this file (env RUNNER_LABEL), never an input
 #
 # What may be deployed from where is fixed in this file (step "Resolve and check the target"):
@@ -11,8 +13,12 @@ name: Deploy to Kubernetes
 #          the repository variable K8S_DEV_DEPLOY_ENABLED is "true"
 #   stage  validation only (validate-only: true); this workflow never deploys it
 #
-# The workflow receives no secrets and no kubeconfig: the in-cluster runner uses its own ServiceAccount
-# (arc-runners/app-deployer). akjet-ds-apps is ONE runner scale set shared by all application
+# The workflow receives no kubeconfig: the in-cluster runner uses its own ServiceAccount
+# (arc-runners/app-deployer). The only secret it accepts is the optional `app-secrets`: values the caller
+# maps explicitly from its repository secrets to keys of Kubernetes Secrets the release declares
+# (requiredSecrets). They are used by the deploy job only, written with server-side apply, never printed and
+# never stored in a ConfigMap, a Helm release, an output, an artifact or a summary.
+# akjet-ds-apps is ONE runner scale set shared by all application
 # repositories; on GitHub Free it sits in the organization Default runner group, so GitHub does not
 # restrict which repository reaches it. The enforced boundary is the cluster RBAC: the ServiceAccount
 # has only a namespaced Role in the application namespaces whose workloads are enabled.
@@ -67,6 +73,16 @@ on:
         description: Print the last log lines of the release pods when the deployment fails
         type: boolean
         default: false
+    secrets:
+      app-secrets:
+        description: >-
+          Optional values for Kubernetes Secrets of the release, one per line, composed by the caller from
+          its own repository secrets:  <secret>.<KEY>=<value>  writes KEY of the Secret <release>-<secret>;
+          <secret>.<KEY>?=<value>  is skipped while the value is empty. <secret> and KEY must be declared in
+          requiredSecrets of the values. A line without "?" and with an empty value stops the deployment
+          before anything is changed. Only the deploying job (dev) may receive it. The Secret objects are
+          created by the platform; the runner may only patch the ones it was granted.
+        required: false
 
 permissions:
   contents: read
@@ -100,6 +116,7 @@ jobs:
       digest: ${{ steps.target.outputs.digest }}
       deploy: ${{ steps.target.outputs.deploy }}
       overrides: ${{ steps.overrides.outputs.json }}
+      declared-secrets: ${{ steps.declared.outputs.list }}
     steps:
       - name: Resolve and check the target
         id: target
@@ -113,6 +130,8 @@ jobs:
           TIMEOUT: ${{ inputs.timeout }}
           VALIDATE_ONLY: ${{ inputs.validate-only }}
           DEPLOY_ENABLED: ${{ vars.K8S_DEV_DEPLOY_ENABLED }}
+          # Only whether the secret was passed, never its content: this job runs outside the cluster.
+          APP_SECRETS_SUPPLIED: ${{ secrets.app-secrets != '' }}
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
@@ -141,12 +160,30 @@ jobs:
           service="${GITHUB_REPOSITORY#*/}"
           printf '%s' "${service}" | grep -Eq "${label}" \
             || die "repository name '${service}' cannot be used as a namespace suffix (lower case letters, digits, '-')"
-          namespace="${ENVIRONMENT}-${service}"
+          # Repositories the platform places in one namespace (k8s-infra namespaces/*.yaml). Every other
+          # repository has its own namespace. Changed here, in review, together with the platform registry.
+          case "${service}" in
+            backend|lk-frontend) group="lk-backend" ;;
+            *) group="${service}" ;;
+          esac
+          namespace="${ENVIRONMENT}-${group}"
           [ "${#namespace}" -le 63 ] || die "namespace '${namespace}' is longer than 63 characters"
 
           release="${RELEASE_INPUT:-${service}}"
           printf '%s' "${release}" | grep -Eq "${label}" || die "release must match ${label}"
           [ "${#release}" -le 40 ] || die "release is longer than 40 characters"
+          if [ "${group}" != "${service}" ]; then
+            # Shared namespace: a repository may only manage releases named after itself, so it can never
+            # upgrade, roll back or replace the release of the other repository.
+            case "${release}" in
+              "${service}"|"${service}"-*) ;;
+              *) die "namespace ${namespace} is shared: the release of ${service} must be '${service}' or start with '${service}-'" ;;
+            esac
+          fi
+
+          if [ "${APP_SECRETS_SUPPLIED:-false}" = "true" ] && [ "${deploy}" != "true" ]; then
+            die "app-secrets may be passed only to the job that deploys to dev; validation never receives secret values"
+          fi
 
           if [ "${VALIDATE_ONLY}" = "true" ] && [ -z "${DIGEST}" ]; then
             # Validation does not need a real image: a placeholder digest keeps the schema satisfied.
@@ -273,6 +310,30 @@ jobs:
             echo "No ${prefix}* override is set: values files are used as they are."
           fi
 
+      # Names only (no values exist in this job): "<secret>.<KEY>" for every key the merged values declare in
+      # requiredSecrets. The deploy job refuses to write anything that is not in this list.
+      - name: List declared Secret keys
+        id: declared
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          VALUES_DIR: ${{ inputs.values-dir }}
+        run: |
+          set -euo pipefail
+          for f in "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"; do
+            test -f "${f}" || { echo "::error::values file not found: ${f}"; exit 1; }
+          done
+          # Same precedence as Helm: the environment file wins, lists are replaced.
+          # shellcheck disable=SC2016  # yq / jq programs, not shell
+          list="$(yq ea -o=json '. as $doc ireduce ({}; . * $doc) | .requiredSecrets // {}' \
+                    "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml" \
+                  | jq -r '[to_entries[] | .key as $name | (.value // [])[] | "\($name).\(.)"] | join(" ")')"
+          for item in ${list}; do
+            printf '%s' "${item}" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.[A-Za-z0-9_.-]+$' \
+              || { echo "::error::requiredSecrets entry '${item}' cannot be used as <secret>.<KEY>"; exit 1; }
+          done
+          echo "list=${list}" >> "${GITHUB_OUTPUT}"
+          echo "Declared Secret keys: ${list:-none}"
+
       - name: Install pinned tools
         run: |
           set -euo pipefail
@@ -388,7 +449,8 @@ jobs:
       cancel-in-progress: false
 
     env:
-      # Release data is stored in ConfigMaps: the deployer needs no access to Secrets.
+      # Release data is stored in ConfigMaps: Helm needs no access to Secrets, and no secret value ever
+      # reaches a release record (application Secrets are not part of the chart).
       HELM_DRIVER: configmap
       ENVIRONMENT: dev
       DIGEST: ${{ needs.validate.outputs.digest }}
@@ -439,9 +501,12 @@ jobs:
             kubectl auth can-i ${check} --namespace "${NAMESPACE}" --quiet \
               || { echo "::error::the runner ServiceAccount may not '${check}' in ${NAMESPACE}"; exit 1; }
           done
-          if kubectl auth can-i get secrets --namespace "${NAMESPACE}" --quiet; then
-            echo "::warning::the runner ServiceAccount can read Secrets in ${NAMESPACE}; the deployer role should not allow that"
-          fi
+          # Access to individual, named Secrets (ciManagedSecrets) is expected; access to all of them is not.
+          for verb in get list create; do
+            if kubectl auth can-i "${verb}" secrets --namespace "${NAMESPACE}" --quiet; then
+              echo "::warning::the runner ServiceAccount can ${verb} every Secret in ${NAMESPACE}; the deployer role should not allow that"
+            fi
+          done
 
       - name: Fetch the chart
         id: chart
@@ -472,6 +537,83 @@ jobs:
               echo "dir=$(find "${RUNNER_TEMP}/chart" -mindepth 1 -maxdepth 1 -type d | head -1)" >> "${GITHUB_OUTPUT}" ;;
             *) echo "dir=${CHART}" >> "${GITHUB_OUTPUT}" ;;
           esac
+
+      # GitHub repository secrets -> keys of the Kubernetes Secrets the release declares. Runs before the
+      # migration and the upgrade: a missing value or a missing permission stops the deployment with
+      # nothing changed. Values travel only through this step's environment and kubectl's stdin: they are
+      # never written to a file, a command line, an output or the summary, and each one is masked first.
+      # Server-side apply owns exactly the listed keys; keys written by the platform stay as they are.
+      # The Secret objects are created by the platform, and the runner needs `get` and `patch` on exactly
+      # these names (k8s-infra: ciManagedSecrets) - it is never allowed to create or list Secrets.
+      - name: Provision application Secrets
+        id: secrets
+        env:
+          APP_SECRETS: ${{ secrets.app-secrets }}
+          DECLARED: ${{ needs.validate.outputs.declared-secrets }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APP_SECRETS}" ]; then
+            echo "No app-secrets were passed: Kubernetes Secrets are left as they are."
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          die() { echo "::error::$1"; exit 1; }
+          names=""      # Secret declarations that receive at least one key
+          missing=""    # required keys whose GitHub secret is empty
+          while IFS= read -r line || [ -n "${line}" ]; do
+            line="${line%$'\r'}"
+            [ -n "${line}" ] || continue
+            head="${line%%=*}"
+            [ "${head}" != "${line}" ] || die "app-secrets: every line must be <secret>.<KEY>=<value> (the offending line is not shown)"
+            value="${line#*=}"
+            optional=false
+            case "${head}" in *"?") optional=true; head="${head%?}" ;; esac
+            printf '%s' "${head}" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.[A-Za-z0-9_.-]+$' \
+              || die "app-secrets: a line does not start with <secret>.<KEY> (the offending line is not shown)"
+            case " ${DECLARED} " in
+              *" ${head} "*) ;;
+              *) die "app-secrets: ${head} is not declared in requiredSecrets of the values (${VALUES_DIR}/values*.yaml)" ;;
+            esac
+            if [ -z "${value}" ]; then
+              if [ "${optional}" = "true" ]; then echo "Skipped (optional, not set): ${head}"; else missing="${missing} ${head}"; fi
+              continue
+            fi
+            echo "::add-mask::${value}"
+            name="${head%%.*}"; key="${head#*.}"
+            var="DATA_$(printf '%s' "${name}" | tr '-' '_')"
+            case " ${!var:-} " in *"\"${key}\":"*) die "app-secrets: ${head} is listed twice" ;; esac
+            encoded="$(printf '%s' "${value}" | base64 | tr -d '\n')"
+            printf -v "${var}" '%s' "${!var:+${!var},}\"${key}\":\"${encoded}\""
+            case " ${names} " in *" ${name} "*) ;; *) names="${names} ${name}" ;; esac
+            unset value encoded line
+          done <<< "${APP_SECRETS}"
+          unset APP_SECRETS
+          [ -z "${missing}" ] || die "no value for:${missing} - the repository secret mapped to it is not set (nothing was changed)"
+          [ -n "${names}" ] || { echo "Every mapped key is optional and unset: nothing to write."; echo "changed=false" >> "${GITHUB_OUTPUT}"; exit 0; }
+
+          # All permissions are checked before the first write.
+          for name in ${names}; do
+            for verb in get patch; do
+              kubectl auth can-i "${verb}" "secret/${RELEASE}-${name}" --namespace "${NAMESPACE}" --quiet \
+                || die "the runner may not ${verb} Secret ${RELEASE}-${name} in ${NAMESPACE}: the platform has to list it in ciManagedSecrets of the namespace (k8s-infra) - nothing was changed"
+            done
+          done
+          changed=false
+          for name in ${names}; do
+            object="${RELEASE}-${name}"
+            before="$(kubectl --namespace "${NAMESPACE}" get secret "${object}" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null)" \
+              || die "Secret ${object} does not exist in ${NAMESPACE}: the platform creates the (empty) object, this workflow only fills it"
+            var="DATA_$(printf '%s' "${name}" | tr '-' '_')"
+            printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"%s"},"data":{%s}}\n' "${object}" "${!var}" \
+              | kubectl --namespace "${NAMESPACE}" apply --server-side --field-manager=akjet-app-secrets --force-conflicts -f - >/dev/null \
+              || die "writing Secret ${object} failed (the response is not shown)"
+            after="$(kubectl --namespace "${NAMESPACE}" get secret "${object}" -o jsonpath='{.metadata.resourceVersion}')"
+            keys="$(printf '%s' "${!var}" | tr ',' '\n' | cut -d'"' -f2 | tr '\n' ' ')"
+            if [ "${before}" != "${after}" ]; then changed=true; state=updated; else state=unchanged; fi
+            echo "Secret ${object}: ${state}; keys managed from GitHub: ${keys}"
+            unset "${var}"
+          done
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
 
       # The migration Job is created before the upgrade and is not part of the Helm release.
       # A failed migration stops the deployment; the schema is never rolled back automatically.
@@ -512,6 +654,8 @@ jobs:
         env:
           CHART_DIR: ${{ steps.chart.outputs.dir }}
           RESTART: ${{ inputs.restart }}
+          # Environment variables from a Secret are read at pod start: a changed Secret needs new pods.
+          SECRETS_CHANGED: ${{ steps.secrets.outputs.changed }}
         run: |
           set -euo pipefail
           args=(
@@ -523,7 +667,7 @@ jobs:
             --rollback-on-failure --wait --timeout "${TIMEOUT}" --history-max 20
             --description "commit ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
           )
-          if [ "${RESTART}" = "true" ]; then
+          if [ "${RESTART}" = "true" ] || [ "${SECRETS_CHANGED}" = "true" ]; then
             args+=(--set-string "rolloutRevision=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
           fi
           helm "${args[@]}"
