@@ -548,6 +548,10 @@ bad_allow "allow-list with another top-level key" 'only the top-level keys "over
 
 mkdir -p "$WORK/ov-none/deploy"
 ov_expect "service without overrides.yaml: mechanism is inactive even if DEV_* variables exist" '{}' dev '{"DEV_ANYTHING":"x"}' "$WORK/ov-none"
+mkdir -p "$WORK/ov-rules/deploy"; printf 'secrets:\n  aliases:\n    DB_MIGRATOR_PASSWORD: migrate.DB_PASSWORD\n' >"$WORK/ov-rules/deploy/overrides.yaml"
+ov_expect "overrides.yaml with bundle rules only (no 'overrides' key): the variable mechanism stays inactive" '{}' dev '{"DEV_ANYTHING":"x"}' "$WORK/ov-rules"
+printf 'overrides: {}\n' >"$WORK/ov-rules/deploy/overrides.yaml"
+ov_reject "an explicit empty allow-list still refuses unknown variables" "DEV_ANYTHING are not listed in overrides.yaml" dev '{"DEV_ANYTHING":"x"}' "$WORK/ov-rules"
 
 resolve_overrides dev '{"DEV_DB_HOST":"pg.override.example.test"}'
 if [ "$(jq -c 'keys' "$WORK/overrides.json")" = '["config"]' ] && ! grep -qiE 'password|secret|token' "$WORK/overrides.json" \
@@ -1033,6 +1037,160 @@ elif [ "$(grep -c '^ERROR: env-bundle: .* is required' "$WORK/op.log")" = "3" ];
 else
   fail "env-bundle.sh check (missing)"; cat "$WORK/op.log"
 fi
+
+echo "== deploy-k8s.yml: pass-through bundle (input env-bundle-secret)"
+if [ "$(yq '.on.workflow_call.inputs."env-bundle-secret" | .type + "/" + (.required // false | tostring) + "/" + .default' "$dk")" = "string/false/" ]; then
+  pass "env-bundle-secret is an optional string input, empty by default (declared mode stays the default)"
+else
+  fail "env-bundle-secret input"
+fi
+pt_check() {  # environment, bundle, [secret=app], [dir]
+  : >"$WORK/bn_output"; rm -f "$WORK/bundle-config.json"
+  ( cd "${4:-$bn_src}" && env -i PATH="$PATH" RUNNER_TEMP="$WORK" GITHUB_OUTPUT="$WORK/bn_output" \
+      ENVIRONMENT="$1" VALUES_DIR=deploy ENV_BUNDLE="$2" BUNDLE_SECRET="${3-app}" bash --noprofile --norc -c "$bn_step" ) </dev/null >"$WORK/bn.log" 2>&1
+}
+pt_out() { sed -n "s/^$1=//p" "$WORK/bn_output"; }
+pt_reject() {  # label, expected text, pt_check args...
+  local label="$1" text="$2"; shift 2
+  if pt_check "$@"; then fail "accepted: $label"
+  elif grep -qF -- "$text" "$WORK/bn.log"; then pass "rejected: $label"
+  else fail "rejected for another reason: $label"; cat "$WORK/bn.log"; fi
+}
+# shellcheck disable=SC2016  # a literal value with shell metacharacters, on purpose
+pt_secret='S3cr3t "quoted" $HOME \ end'
+# shellcheck disable=SC2016  # jq program
+pt_bundle="$(jq -cn --arg s "$pt_secret" --arg c "$cert" '{DEV_REDIS_HOST: "127.0.0.1", DEV_DB_HOST: "127.0.0.1:5432 not a host name", DEV_DB_USERNAME: "runtime_role",
+  DEV_NEVER_DECLARED_ANYWHERE: $s, DEV_FEATURE_WRITES_ENABLED: "maybe", DEV_APP_URL: "not a url", DEV_PARTNER_CERTIFICATE: $c, DEV_DB_PASSWORD: "app-pw",
+  DEV_DB_MIGRATOR_PASSWORD: "mig-pw", DEV_PORT_AS_NUMBER: 6379, DEV_FLAG_AS_BOOLEAN: false, DEV_lowerCase_name: "x", DEV_EMPTY_IS_ABSENT: ""}')"
+if pt_check dev "$pt_bundle" \
+   && [ "$(pt_out plan)" = "app.REDIS_HOST=REDIS_HOST app.DB_HOST=DB_HOST app.DB_USERNAME=DB_USERNAME app.NEVER_DECLARED_ANYWHERE=NEVER_DECLARED_ANYWHERE app.FEATURE_WRITES_ENABLED=FEATURE_WRITES_ENABLED app.APP_URL=APP_URL app.PARTNER_CERTIFICATE=PARTNER_CERTIFICATE app.DB_PASSWORD=DB_PASSWORD migrate.DB_PASSWORD=DB_MIGRATOR_PASSWORD app.PORT_AS_NUMBER=PORT_AS_NUMBER app.FLAG_AS_BOOLEAN=FLAG_AS_BOOLEAN app.lowerCase_name=lowerCase_name" ] \
+   && [ "$(jq -c . "$WORK/bundle-config.json")" = "{}" ]; then
+  pass "pass-through: every <ENV>_<NAME> becomes key NAME of the one Secret - undeclared names, an address as REDIS_HOST, values that are no host / URL / boolean, numbers, booleans; nothing goes to config"
+else
+  fail "pass-through plan: $(pt_out plan)"; cat "$WORK/bn.log"
+fi
+if [ "$(pt_out shadowed)" = "DB_HOST FEATURE_WRITES_ENABLED" ]; then
+  pass "pass-through: names that the values files also set are reported for the migration Job; names under migration.config (DB_USERNAME) are not"
+else
+  fail "shadowed names: '$(pt_out shadowed)'"
+fi
+if ! grep -qF -e "$pt_secret" -e 'app-pw' -e 'mig-pw' -e 'третья строка' -e 'not a url' "$WORK/bn.log" "$WORK/bn_output"; then
+  pass "pass-through: the check prints names only"
+else
+  fail "a value leaked from the pass-through check"
+fi
+case " $(pt_out plan) " in
+  *" migrate.DB_PASSWORD=DB_MIGRATOR_PASSWORD "*)
+    case " $(pt_out plan) " in *"app.DB_MIGRATOR_PASSWORD"*) fail "the migration password is also planned for the application Secret" ;; *) pass "pass-through: the aliased migration password goes only to the migrate Secret" ;; esac ;;
+  *) fail "migration password alias in pass-through mode" ;;
+esac
+pt_reject "malformed JSON (before any Kubernetes access)" "env-bundle is not a JSON object" dev '{"DEV_REDIS_HOST": "127.0.0.1"'
+pt_reject "a JSON array" "env-bundle is not a JSON object" dev '[1]'
+pt_reject "a nested object as a value" "DEV_X: the value must be a string, a number or a boolean, not object" dev '{"DEV_X": {"a": 1}}'
+pt_reject "null as a value" "DEV_X: the value must be a string, a number or a boolean, not null" dev '{"DEV_X": null}'
+pt_reject "a name that cannot be an environment variable" "is not a valid environment variable name" dev '{"DEV_bad-name": "x"}'
+pt_reject "a key of another environment" "STAGE_REDIS_HOST does not start with DEV_" dev '{"STAGE_REDIS_HOST": "127.0.0.1"}'
+pt_reject "a Secret that the values files do not declare" "nosuch is not a Secret declared in requiredSecrets" dev '{"DEV_X": "1"}' nosuch
+pt_reject "an invalid Secret name" "env-bundle-secret must be the name of a Secret" dev '{"DEV_X": "1"}' 'app;id'
+if pt_check dev '{"DEV_ONLY": "x"}' && [ "$(pt_out plan)" = "app.ONLY=ONLY" ]; then
+  pass "pass-through: nothing is required - a bundle with one variable is accepted"
+else
+  fail "pass-through with a single key"; cat "$WORK/bn.log"
+fi
+# without the input the SAME bundle is still judged by the declared mode (other services are unaffected)
+bn_reject "the same bundle without env-bundle-secret (declared mode unchanged)" "NEVER_DECLARED_ANYWHERE is declared neither in requiredSecrets" dev "$pt_bundle"
+
+# deploy side
+pt_check dev "$pt_bundle"; pt_plan="$(pt_out plan)"; pt_shadowed="$(pt_out shadowed)"
+pt_provision() {  # bundle, plan, [secret=app], [declared], [denied]
+  : >"$WORK/sec_output"
+  env -i PATH="$fakebin:$PATH" GITHUB_OUTPUT="$WORK/sec_output" RUNNER_TEMP="$WORK" FAKE_STATE="$sec_state" FAKE_DENY="${5:-}" \
+    NAMESPACE=dev-example-api RELEASE=example-api VALUES_DIR=deploy ENVIRONMENT=dev APP_SECRETS="" \
+    ENV_BUNDLE="$1" PLAN="$2" BUNDLE_SECRET="${3-app}" DECLARED="${4-$bn_declared}" bash --noprofile --norc -c "$sec_step" </dev/null >"$WORK/sec.log" 2>&1
+}
+sec_reset example-api-app example-api-migrate
+if pt_provision "$pt_bundle" "$pt_plan" && [ "$(cat "$WORK/sec_output")" = "changed=true" ] \
+   && [ "$(sec_data example-api-app REDIS_HOST)" = "127.0.0.1" ] && [ "$(sec_data example-api-app NEVER_DECLARED_ANYWHERE)" = "$pt_secret" ] \
+   && [ "$(sec_data example-api-app DB_HOST)" = "127.0.0.1:5432 not a host name" ] && [ "$(sec_data example-api-app PORT_AS_NUMBER)" = "6379" ] \
+   && [ "$(sec_data example-api-app FLAG_AS_BOOLEAN)" = "false" ] && [ "$(sec_data example-api-app lowerCase_name)" = "x" ] \
+   && [ "$(jq -r '.PARTNER_CERTIFICATE | @base64d' "$sec_state/example-api-app.json"; echo x)" = "$(printf '%s\nx' "$cert")" ] \
+   && [ "$(jq -r 'has("EMPTY_IS_ABSENT")' "$sec_state/example-api-app.json")" = "false" ]; then
+  pass "pass-through: every value reaches the application Secret unchanged (multi-line, quotes, non-ASCII); an empty value is not written"
+else
+  fail "pass-through provisioning"; grep -v '^::add-mask::' "$WORK/sec.log"
+fi
+if [ "$(sec_data example-api-migrate DB_PASSWORD)" = "mig-pw" ] && [ "$(jq -c 'keys' "$sec_state/example-api-migrate.json")" = '["DB_PASSWORD"]' ] \
+   && [ "$(sec_data example-api-app DB_PASSWORD)" = "app-pw" ] && [ "$(jq -r 'has("DB_MIGRATOR_PASSWORD")' "$sec_state/example-api-app.json")" = "false" ] \
+   && ! grep -q 'bWlnLXB3' "$sec_state/example-api-app.json"; then
+  pass "pass-through: the migration password is DB_PASSWORD of the migrate Secret only; it never reaches the application Secret"
+else
+  fail "migration password isolation in pass-through mode"
+fi
+if ! grep -v '^::add-mask::' "$WORK/sec.log" | grep -qF -e "$pt_secret" -e 'app-pw' -e 'mig-pw' -e 'третья строка' && ! grep -qF -e "$pt_secret" -e 'mig-pw' "$WORK/sec_output" "$sec_state/calls.log"; then
+  pass "pass-through: no value in the log, the outputs or a command line"
+else
+  fail "a pass-through value leaked on the deploy side"; grep -v '^::add-mask::' "$WORK/sec.log"
+fi
+sec_reset example-api-app example-api-migrate
+pt_reject_deploy() {  # label, text, pt_provision args
+  local label="$1" text="$2"; shift 2
+  if pt_provision "$@"; then fail "accepted: $label"
+  elif ! grep -qF -- "$text" "$WORK/sec.log"; then fail "rejected for another reason: $label"; grep -v '^::add-mask::' "$WORK/sec.log"
+  elif grep -q ' apply ' "$sec_state/calls.log"; then fail "$label: a Secret was written before the failure"
+  else pass "rejected, nothing written: $label"; fi
+}
+pt_reject_deploy "an undeclared key without pass-through (the input is what opens the Secret)" "app.REDIS_HOST is not declared in requiredSecrets" "$pt_bundle" "$pt_plan" ""
+pt_reject_deploy "a planned key of another Secret than the pass-through one" "other.X is not declared in requiredSecrets" "$pt_bundle" "other.X=REDIS_HOST"
+pt_reject_deploy "a pass-through Secret that the values do not declare" "nosuch.X is not declared in requiredSecrets" "$pt_bundle" "nosuch.X=REDIS_HOST" nosuch
+pt_reject_deploy "the runner may not patch the migrate Secret" "may not patch Secret example-api-migrate" "$pt_bundle" "$pt_plan" app "$bn_declared" "patch:example-api-migrate"
+sec_reset example-api-migrate
+pt_reject_deploy "the application Secret does not exist (platform prerequisite)" "Secret example-api-app does not exist in dev-example-api: the platform creates the (empty) object" "$pt_bundle" "$pt_plan"
+
+# where the values end up in the containers
+"$HELM" template example-api "$CHART" --namespace dev-example-api -f "$bn_src/deploy/values.yaml" -f "$bn_src/deploy/values-dev.yaml" \
+  --set migration.render=true --set-string migration.runId=t1 >"$WORK/pt-rendered.yaml"
+pt_objects="$(yq ea -o=json '[.]' "$WORK/pt-rendered.yaml")"
+if [ "$(jq -c '.[] | select(.kind == "Deployment") | .spec.template.spec.containers[0] | [((.env // []) | length), ([.envFrom[] | (.configMapRef // .secretRef).name] | join(","))]' <<<"$pt_objects")" = '[0,"example-api-config,example-api-app"]' ]; then
+  pass "workloads: no explicit env; envFrom lists the ConfigMap first and the application Secret last, so a key of the Secret overrides the values files"
+else
+  fail "envFrom order of the workload"
+fi
+mig_step="$(yq '.jobs.deploy.steps[] | select(.name == "Run the migration Job") | .run' "$dk")"
+migbin="$WORK/migbin"; mkdir -p "$migbin"
+cat >"$migbin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  "create --dry-run=client -o json -f "*) yq -o=json '.' "${@: -1}" ;;
+  *" create -f -") cat >"$FAKE_STATE/job.json" ;;
+  *" create -f "*) yq -o=json '.' "${@: -1}" >"$FAKE_STATE/job.json" ;;
+  *" get job "*) printf '1/' ;;
+  *" logs "*) echo "migrated" ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+FAKE
+chmod +x "$migbin/kubectl"; ln -sf "$(command -v "$HELM")" "$migbin/helm"
+run_migration() {  # shadowed names
+  rm -f "$sec_state/job.json"; cp "$WORK/overrides.json" "$WORK/overrides.keep" 2>/dev/null || true; echo '{}' >"$WORK/overrides.json"
+  ( cd "$bn_src" && env -i PATH="$migbin:$PATH" HOME="$WORK" RUNNER_TEMP="$WORK" GITHUB_STEP_SUMMARY="$WORK/mig_summary" FAKE_STATE="$sec_state" \
+      GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RELEASE=example-api NAMESPACE=dev-example-api ENVIRONMENT=dev VALUES_DIR=deploy TIMEOUT=10s \
+      DIGEST="$good_digest" CHART_DIR="$OLDPWD/$CHART" SHADOWED="$1" bash --noprofile --norc -c "$mig_step" ) </dev/null >"$WORK/mig.log" 2>&1
+}
+job_env() { jq -r '[.spec.template.spec.containers[0].env[] | .name + "=" + .value] | join(" ")' "$sec_state/job.json"; }
+if run_migration "" && [ "$(job_env)" = "APP_ENV=dev DB_HOST=db.default.example.test DB_PORT=5432 DB_USERNAME=example_migrator FEATURE_WRITES_ENABLED=false LOG_CHANNEL=stderr" ]; then
+  pass "migration Job without a pass-through bundle: created exactly as rendered (other services are unaffected)"
+else
+  fail "migration Job without shadowed names: $(job_env 2>/dev/null)"; cat "$WORK/mig.log"
+fi
+if run_migration "$pt_shadowed" && [ "$(job_env)" = "APP_ENV=dev DB_PORT=5432 DB_USERNAME=example_migrator LOG_CHANNEL=stderr" ] \
+   && [ "$(jq -r '[.spec.template.spec.containers[0].envFrom[].secretRef.name] | join(",")' "$sec_state/job.json")" = "example-api-app,example-api-migrate" ] \
+   && [ "$(jq -r '.kind + "/" + .metadata.name' "$sec_state/job.json")" = "Job/example-api-migrate-1-1" ]; then
+  pass "migration Job with a pass-through bundle: env entries the Secret provides are dropped (the Secret is not overridden); DB_USERNAME stays the migration role; the migrate Secret is last"
+else
+  fail "migration Job with shadowed names: $(job_env 2>/dev/null)"; cat "$WORK/mig.log"
+fi
+# shellcheck disable=SC2016  # a literal attempt at injection
+if run_migration 'DB_HOST;$(id)'; then fail "a malformed list of names was accepted by the migration step"; else pass "migration step refuses a malformed list of names"; fi
 
 echo "== consumers: every application repository against the candidate workflows"
 cc=(python3 tests/check_consumers.py)

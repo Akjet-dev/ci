@@ -77,6 +77,16 @@ on:
         description: Print the last log lines of the release pods when the deployment fails
         type: boolean
         default: false
+      env-bundle-secret:
+        description: >-
+          Pass-through mode of env-bundle: the name of ONE Secret declared in requiredSecrets (for example
+          "app"). Every <ENV>_<NAME> entry of the bundle then becomes the key NAME of that Kubernetes Secret,
+          with its value unchanged - no declaration per variable, no allow-list, no type check. Only entries
+          renamed by secrets.aliases of <values-dir>/overrides.yaml go elsewhere (the migration password).
+          A NAME that the values files also set under config is removed from the rendered configuration, so
+          the Secret is its only source. Empty (default): the declared mode described at the secret.
+        type: string
+        default: ''
     secrets:
       app-secrets:
         description: >-
@@ -133,6 +143,7 @@ jobs:
       overrides: ${{ steps.overrides.outputs.json }}
       declared-secrets: ${{ steps.declared.outputs.list }}
       secret-plan: ${{ steps.bundle.outputs.plan }}
+      bundle-shadowed: ${{ steps.bundle.outputs.shadowed }}
     steps:
       - name: Resolve and check the target
         id: target
@@ -263,6 +274,7 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           VALUES_DIR: ${{ inputs.values-dir }}
           ENV_BUNDLE: ${{ secrets.env-bundle }}
+          BUNDLE_SECRET: ${{ inputs.env-bundle-secret }}
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
@@ -270,8 +282,13 @@ jobs:
           prefix="$(printf '%s' "${ENVIRONMENT}" | tr '[:lower:]' '[:upper:]')_"
           config_out="${RUNNER_TEMP}/bundle-config.json"
           echo '{}' > "${config_out}"
+          target="${BUNDLE_SECRET:-}"
+          if [ -n "${target}" ]; then
+            printf '%s' "${target}" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' || die "env-bundle-secret must be the name of a Secret of requiredSecrets"
+          fi
           if [ "${mode}" = "check" ] && [ -z "${ENV_BUNDLE:-}" ]; then
             echo "plan=" >> "${GITHUB_OUTPUT}"
+            echo "shadowed=" >> "${GITHUB_OUTPUT}"
             echo "No env-bundle was passed."
             exit 0
           fi
@@ -280,7 +297,7 @@ jobs:
           done
           # Declarations of the service (names only), with the precedence of Helm.
           # shellcheck disable=SC2016  # yq / jq programs, not shell
-          yq ea -o=json '. as $doc ireduce ({}; . * $doc) | {"config": ((.config // {}) | keys), "secrets": (.requiredSecrets // {})}' \
+          yq ea -o=json '. as $doc ireduce ({}; . * $doc) | {"config": ((.config // {}) | keys), "secrets": (.requiredSecrets // {}), "migration": ((.migration.config // {}) | keys)}' \
             "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml" > "${RUNNER_TEMP}/bundle-declared.json"
           if [ -f "${VALUES_DIR}/overrides.yaml" ]; then
             yq -o=json '.' "${VALUES_DIR}/overrides.yaml" > "${RUNNER_TEMP}/bundle-rules.json"
@@ -296,7 +313,7 @@ jobs:
             ENV_BUNDLE='{}'; bytes=0
           fi
           # shellcheck disable=SC2016  # jq program, not shell
-          result="$(printf '%s' "${ENV_BUNDLE}" | jq -c --arg prefix "${prefix}" --arg env "${ENVIRONMENT}" \
+          result="$(printf '%s' "${ENV_BUNDLE}" | jq -c --arg prefix "${prefix}" --arg env "${ENVIRONMENT}" --arg target "${target}" \
                       --slurpfile decl "${RUNNER_TEMP}/bundle-declared.json" --slurpfile rules "${RUNNER_TEMP}/bundle-rules.json" '
             . as $b
             | $decl[0] as $d
@@ -316,7 +333,32 @@ jobs:
                 | "secrets.aliases: an entry is not NAME: <secret>.<KEY>")) as $badAliases
             | def optional($t): ($optional | index($t)) != null or ($optional | index(($t | split(".")[0]) + ".*")) != null;
             def provided($t): ($b[$prefix + $source[$t]] | type == "string" and length > 0);
-            if $mode == "template" then
+            if $target != "" then
+              # Pass-through: every entry is a key of ONE Secret. No declaration, no allow-list, no type check.
+              ( [ $aliases | to_entries[] | select(.value | startswith($target + ".")) | .key ] ) as $aliasedIntoTarget
+              | ( [ $b | to_entries[]
+                    | .key as $k | .value as $v
+                    | if ($k | startswith($prefix) | not) then
+                        (if ($k | test("^[A-Z][A-Z0-9]*_[A-Za-z_][A-Za-z0-9_]*$")) then "\($k) does not start with \($prefix): a bundle holds the keys of exactly one environment and this run accepts no other"
+                         else "a key does not start with \($prefix) (the key is not shown)" end)
+                      else ($k | ltrimstr($prefix)) as $n
+                      | if ($n | test("^[A-Za-z_][A-Za-z0-9_]*$") | not) then "a \($prefix)* key is not a valid environment variable name: letters, digits and _ only, not starting with a digit (the key is not shown)"
+                        elif ($v | type) as $t | ($t != "string" and $t != "number" and $t != "boolean") then "\($k): the value must be a string, a number or a boolean, not \($v | type)"
+                        else empty end
+                      end ] ) as $keyErrors
+              | ( if ($d.secrets | has($target)) then [] else ["env-bundle-secret: \($target) is not a Secret declared in requiredSecrets of the values files"] end
+                  + [ $aliases | to_entries[] | (.value | split(".")[0]) as $s | select(($d.secrets | has($s)) | not)
+                      | "secrets.aliases.\(.key): Secret \($s) is not declared in requiredSecrets of the values files" ] ) as $declErrors
+              | ( [ $b | to_entries[] | select(.key | startswith($prefix)) | (.key | ltrimstr($prefix)) as $n
+                    | select(($n | test("^[A-Za-z_][A-Za-z0-9_]*$")) and ((.value | type) as $t | $t == "string" or $t == "number" or $t == "boolean"))
+                    | select((.value | type) != "string" or (.value | length) > 0)
+                    | $n ] ) as $names
+              | { errors: ($badAliases + $declErrors + $keyErrors),
+                  plan: ($names | map(if $aliases[.] != null then "\($aliases[.])=\(.)" else "\($target).\(.)=\(.)" end)),
+                  # set by the values files AND supplied by the bundle; settings under migration.config are not shadowed
+                  shadowed: ($names | map(select(. as $n | $aliases[$n] == null and ($d.config | index($n)) != null and ($d.migration | index($n)) == null))),
+                  config: {}, template: ($aliases | keys | map({key: ($prefix + .), value: ""}) | from_entries) }
+            elif $mode == "template" then
               { template:
                   ( ($targets | map(select(optional(.) | not)) | map({key: ($prefix + $source[.]), value: ""}))
                   + ($targets | map(select(optional(.))) | map({key: ($prefix + $source[.]), value: ""}))
@@ -362,7 +404,14 @@ jobs:
           printf '%s' "${result}" | jq -c '.config' > "${config_out}"
           plan="$(printf '%s' "${result}" | jq -r '.plan | join(" ")')"
           echo "plan=${plan}" >> "${GITHUB_OUTPUT}"
+          # Names set by the values files that the Secret also provides. In the workloads the Secret wins by
+          # itself (envFrom: ConfigMap first, Secret last). The migration Job declares its configuration as
+          # explicit env, which would win over the Secret - the deploy job removes exactly these entries.
+          echo "shadowed=$(printf '%s' "${result}" | jq -r '(.shadowed // []) | join(" ")')" >> "${GITHUB_OUTPUT}"
           echo "env-bundle: ${bytes} bytes (GitHub limit for one secret: 48 KB)"
+          if [ -n "${target}" ]; then
+            echo "Pass-through to Secret '${target}': $(printf '%s' "${result}" | jq -r '.plan | length') entries; values of the values files that the Secret overrides: $(printf '%s' "${result}" | jq -r '.shadowed | join(", ") | if . == "" then "none" else . end')"
+          fi
           echo "Secret keys from the bundle: $(printf '%s' "${result}" | jq -r '[.plan[] | split("=")[0]] | join(", ") | if . == "" then "none" else . end')"
           echo "Configuration overrides from the bundle: $(printf '%s' "${result}" | jq -r '.config | keys | map(ltrimstr($p)) | join(", ") | if . == "" then "none" else . end' --arg p "${prefix}")"
           if [ "${bytes}" -gt 44000 ]; then
@@ -404,6 +453,15 @@ jobs:
           bundle_file="${RUNNER_TEMP}/bundle-config.json"
           [ -f "${bundle_file}" ] || echo '{}' > "${bundle_file}"
           yq -o=json '.' "${allow}" > "${RUNNER_TEMP}/overrides-allow.json"
+          # A file that only carries rules for env-bundle (secrets, locked) and has no "overrides" key does not
+          # switch the variable mechanism on: repository variables are not consulted, as without the file.
+          if jq -e 'type == "object" and (has("overrides") | not) and ((keys - ["secrets", "locked"]) | length == 0)' "${RUNNER_TEMP}/overrides-allow.json" >/dev/null 2>&1; then
+            echo '{}' > "${out}"
+            echo "json={}" >> "${GITHUB_OUTPUT}"
+            rm -f "${RUNNER_TEMP}/bundle-config.json"
+            echo "${allow} lists no overrides: values files are used as they are."
+            exit 0
+          fi
           # shellcheck disable=SC2016  # jq program, not shell
           jq -n --arg prefix "${prefix}" --arg env "${ENVIRONMENT}" --slurpfile allow "${RUNNER_TEMP}/overrides-allow.json" \
                 --slurpfile vars "${vars_file}" --slurpfile bundle "${bundle_file}" '
@@ -705,6 +763,7 @@ jobs:
           ENV_BUNDLE: ${{ secrets.env-bundle }}
           DECLARED: ${{ needs.validate.outputs.declared-secrets }}
           PLAN: ${{ needs.validate.outputs.secret-plan }}
+          BUNDLE_SECRET: ${{ inputs.env-bundle-secret }}
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
@@ -746,22 +805,26 @@ jobs:
             [ -n "${PLAN:-}" ] || done_unchanged "env-bundle carries no Secret keys: Kubernetes Secrets are left as they are."
             prefix="$(printf '%s' "${ENVIRONMENT}" | tr '[:lower:]' '[:upper:]')_"
             for item in ${PLAN}; do
-              printf '%s' "${item}" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.[A-Za-z0-9_.-]+=[A-Z][A-Z0-9_]*$' \
+              printf '%s' "${item}" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.[A-Za-z0-9_.-]+=[A-Za-z_][A-Za-z0-9_]*$' \
                 || die "the Secret plan of the validate job is malformed (nothing was changed)"
+              planned="${item%%=*}"
               case " ${DECLARED} " in
-                *" ${item%%=*} "*) ;;
-                *) die "env-bundle: ${item%%=*} is not declared in requiredSecrets of the values (nothing was changed)" ;;
+                *" ${planned} "*) ;;
+                *)
+                  # Pass-through: any key of the ONE named Secret, provided that Secret itself is declared.
+                  if [ -n "${BUNDLE_SECRET:-}" ] && [ "${planned%%.*}" = "${BUNDLE_SECRET}" ] && case " ${DECLARED}" in *" ${BUNDLE_SECRET}."*) true ;; *) false ;; esac; then :
+                  else die "env-bundle: ${planned} is not declared in requiredSecrets of the values (nothing was changed)"; fi ;;
               esac
             done
             # The bundle must still hold every planned key (jq diagnostics would quote the input: discarded).
             # shellcheck disable=SC2016  # jq program, not shell
             printf '%s' "${ENV_BUNDLE}" | jq -e --arg p "${prefix}" --arg plan "${PLAN}" '
-              . as $b | all($plan | split(" ")[]; (split("=")[1]) as $n | ($b[$p + $n] | type == "string" and length > 0))' >/dev/null 2>&1 \
+              . as $b | all($plan | split(" ")[]; (split("=")[1]) as $n | ($b[$p + $n] | type) as $t | ($t == "string" or $t == "number" or $t == "boolean"))' >/dev/null 2>&1 \
               || die "env-bundle does not contain every key planned by the validate job (nothing was changed)"
             # Mask every line of every value (a multi-line value is masked line by line).
             # shellcheck disable=SC2016  # jq program, not shell
             printf '%s' "${ENV_BUNDLE}" | jq -r --arg p "${prefix}" --arg plan "${PLAN}" '
-              . as $b | $plan | split(" ")[] | $b[$p + (split("=")[1])] | split("\n")[] | sub("\r$"; "") | select(length >= 6)' 2>/dev/null \
+              . as $b | $plan | split(" ")[] | $b[$p + (split("=")[1])] | tostring | split("\n")[] | sub("\r$"; "") | select(length >= 6)' 2>/dev/null \
               | while IFS= read -r line; do echo "::add-mask::${line}"; done
             names=""
             for item in ${PLAN}; do
@@ -782,7 +845,7 @@ jobs:
                 . as $b
                 | { apiVersion: "v1", kind: "Secret", metadata: { name: $object },
                     data: ([ $plan | split(" ")[] | split("=") | select(.[0] | startswith($s + "."))
-                             | { key: (.[0] | ltrimstr($s + ".")), value: ($b[$p + .[1]] | @base64) } ] | from_entries) }' 2>/dev/null \
+                             | { key: (.[0] | ltrimstr($s + ".")), value: ($b[$p + .[1]] | tostring | @base64) } ] | from_entries) }' 2>/dev/null \
                 | apply_secret "${object}" "${keys}"
             done
             unset ENV_BUNDLE
@@ -841,6 +904,7 @@ jobs:
         if: inputs.run-migrations
         env:
           CHART_DIR: ${{ steps.chart.outputs.dir }}
+          SHADOWED: ${{ needs.validate.outputs.bundle-shadowed }}
         run: |
           set -euo pipefail
           run_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -851,7 +915,22 @@ jobs:
             --set migration.render=true --set-string "migration.runId=${run_id}" \
             --show-only templates/migration-job.yaml > "${RUNNER_TEMP}/migration.yaml"
           job="${RELEASE}-migrate-${run_id}"
-          kubectl --namespace "${NAMESPACE}" create -f "${RUNNER_TEMP}/migration.yaml"
+          if [ -n "${SHADOWED:-}" ]; then
+            # Pass-through bundle: these names come from the Secret. Their explicit env entries (values files)
+            # are dropped from the Job so that the Secret is not overridden; migration.config stays untouched.
+            # Only names are handled here - the manifest contains no Secret value.
+            for name in ${SHADOWED}; do
+              printf '%s' "${name}" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$' || { echo "::error::malformed list of bundle names"; exit 1; }
+            done
+            command -v jq >/dev/null 2>&1 || { echo "::error::jq is not available on the runner; the migration Job cannot be prepared"; exit 1; }
+            # shellcheck disable=SC2016  # jq program, not shell
+            kubectl create --dry-run=client -o json -f "${RUNNER_TEMP}/migration.yaml" \
+              | jq --arg names "${SHADOWED}" '($names | split(" ")) as $drop
+                    | .spec.template.spec.containers |= map(if .env then .env |= map(select(.name as $n | ($drop | index($n)) | not)) else . end)' \
+              | kubectl --namespace "${NAMESPACE}" create -f -
+          else
+            kubectl --namespace "${NAMESPACE}" create -f "${RUNNER_TEMP}/migration.yaml"
+          fi
 
           seconds="${TIMEOUT%[sm]}"; case "${TIMEOUT}" in *m) seconds=$((seconds * 60)) ;; esac
           deadline=$(( $(date +%s) + seconds ))

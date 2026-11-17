@@ -10,7 +10,7 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "0000000000000000000000000000000000000000",
+     "ref": "a44236813f8ef4e3f1a96ace53f5642e06672e1c",
      "secrets": {},
      "uses": "deploy-k8s.yml",
      "with": {
@@ -29,7 +29,7 @@
       "contents": "read",
       "packages": "write"
      },
-     "ref": "0000000000000000000000000000000000000000",
+     "ref": "a44236813f8ef4e3f1a96ace53f5642e06672e1c",
      "secrets": {
       "build-secrets": "COMPOSER_AUTH={\"http-basic\":{\"nova.laravel.com\":{\"username\":\"${{ secrets.NOVA_USERNAME }}\",\"password\":\"${{ secrets.NOVA_LICENSE_KEY }}\"}},\"github-oauth\":{\"github.com\":\"${{ github.token }}\"}}\n"
      },
@@ -69,13 +69,14 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "0000000000000000000000000000000000000000",
+     "ref": "a44236813f8ef4e3f1a96ace53f5642e06672e1c",
      "secrets": {
       "env-bundle": "${{ secrets.DEV_BACKEND_ENV }}"
      },
      "uses": "deploy-k8s.yml",
      "with": {
       "chart-version": "0.1.0",
+      "env-bundle-secret": "app",
       "environment": "dev",
       "image-digest": "${{ inputs.digest }}",
       "restart": "${{ inputs.restart }}",

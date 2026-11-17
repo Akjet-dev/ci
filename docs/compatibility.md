@@ -13,7 +13,7 @@
 | | `build-image.yml` | `deploy-k8s.yml` |
 |---|---|---|
 | Обязательные входы | нет | `environment`, `chart-version` |
-| Необязательные входы | `image`, `context`, `dockerfile`, `target`, `build-args`, `platform`, `cache`, `push`, `scan`, `scan-fail-on` | `validate-only`, `image-digest`, `release`, `values-dir`, `chart`, `run-migrations`, `restart`, `timeout`, `pod-logs-on-failure` |
+| Необязательные входы | `image`, `context`, `dockerfile`, `target`, `build-args`, `platform`, `cache`, `push`, `scan`, `scan-fail-on` | `validate-only`, `image-digest`, `release`, `values-dir`, `chart`, `run-migrations`, `restart`, `timeout`, `pod-logs-on-failure`, `env-bundle-secret` |
 | Секреты (все необязательные) | `build-secrets` | `app-secrets`, `env-bundle` |
 | Выходы | `image`, `digest`, `published` | нет |
 | Права токена у вызывающего job'а | `contents: read`, `packages: write` | `contents: read`, `packages: read` |
@@ -23,6 +23,7 @@
 | Возможность | Включается | Если не передано |
 |---|---|---|
 | Набор окружения | секрет `env-bundle` | шаг сообщает «No env-bundle was passed» и ничего не делает |
+| Сквозной режим набора | вход `env-bundle-secret` вместе с `env-bundle` | набор проверяется по объявлениям сервиса, как раньше |
 | Явные секреты приложения | секрет `app-secrets` | Kubernetes Secret'ы не трогаются, `kubectl` не вызывается |
 | Миграции | вход `run-migrations: true` | Job не рендерится и не создаётся |
 | Переопределения переменными | файл `deploy/overrides.yaml` | действуют values-файлы |
