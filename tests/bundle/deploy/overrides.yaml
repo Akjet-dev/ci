@@ -1,0 +1,14 @@
+overrides:
+  DB_HOST: { path: config.DB_HOST, type: host }
+  DB_PORT: { path: config.DB_PORT, type: integer }
+  APP_URL: { path: config.APP_URL, type: url }
+  PARTNER_API_URL: { path: config.PARTNER_API_URL, type: url }
+  FEATURE_WRITES_ENABLED: { path: config.FEATURE_WRITES_ENABLED, type: boolean }
+secrets:
+  aliases:
+    DB_MIGRATOR_PASSWORD: migrate.DB_PASSWORD
+  optional:
+    - app.PARTNER_CERTIFICATE
+    - integrations.*
+locked:
+  dev: [FEATURE_WRITES_ENABLED, PARTNER_API_URL]
