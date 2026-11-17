@@ -1,0 +1,4 @@
+config:
+  APP_ENV: dev
+  APP_URL: https://api.dev.example.test
+  DB_HOST: postgres.dev.example.test

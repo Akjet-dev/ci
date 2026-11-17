@@ -1,0 +1,18 @@
+# Fixture for tests/run.sh: optional overrides by repository variables.
+image:
+  repository: ghcr.io/example-org/example-api
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+config:
+  LOG_CHANNEL: stderr
+  DB_PORT: "5432"
+  FEATURE_WRITES_ENABLED: "false"
+requiredSecrets:
+  app: [APP_KEY, DB_PASSWORD]
+envFromSecrets: [app]
+components:
+  web:
+    ports: { http: 8080 }
+    service: { enabled: true }
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }

@@ -421,6 +421,128 @@ else
   fail "Push step condition changed"
 fi
 
+echo "== deploy-k8s.yml: optional overrides by repository variables"
+ov_step="$(yq '.jobs.validate.steps[] | select(.id == "overrides") | .run' "$dk")"
+ov_src=tests/overrides
+resolve_overrides() {  # environment, repository-variables JSON, [directory with deploy/]
+  local dir="${3:-$ov_src}"
+  : >"$WORK/ov_output"; : >"$WORK/ov_summary"; rm -f "$WORK/overrides.json"
+  ( cd "$dir" && env -i PATH="$PATH" RUNNER_TEMP="$WORK" GITHUB_OUTPUT="$WORK/ov_output" GITHUB_STEP_SUMMARY="$WORK/ov_summary" \
+      ENVIRONMENT="$1" VALUES_DIR=deploy REPOSITORY_VARIABLES="$2" bash -c "$ov_step" ) >"$WORK/ov.log" 2>&1
+}
+ov_json() { sed -n 's/^json=//p' "$WORK/ov_output"; }
+ov_expect() {  # label, expected JSON, environment, variables
+  local label="$1" want="$2"; shift 2
+  if resolve_overrides "$@" && [ "$(ov_json)" = "$want" ]; then pass "$label"; else fail "$label: got '$(ov_json)'"; cat "$WORK/ov.log"; fi
+}
+ov_reject() {  # label, expected text, environment, variables, [dir]
+  local label="$1" text="$2"; shift 2
+  if resolve_overrides "$@"; then fail "accepted: $label ($(ov_json))"
+  elif grep -qF -- "$text" "$WORK/ov.log"; then pass "rejected: $label"
+  else fail "rejected for another reason: $label"; cat "$WORK/ov.log"; fi
+}
+render_ov() {  # environment -> rendered manifest with the overrides of $WORK/overrides.json
+  render -f "$ov_src/deploy/values.yaml" -f "$ov_src/deploy/values-$1.yaml" -f "$WORK/overrides.json"
+}
+config_of() { yq 'select(.kind == "ConfigMap") | .data' -o=json -I0; }
+base_dev="$(render -f "$ov_src/deploy/values.yaml" -f "$ov_src/deploy/values-dev.yaml")"
+base_stage="$(render -f "$ov_src/deploy/values.yaml" -f "$ov_src/deploy/values-stage.yaml")"
+
+ov_expect "no variables: nothing is overridden" '{}' dev '{}'
+if [ "$(render_ov dev)" = "$base_dev" ]; then pass "no variables: the rendered release is byte-identical to the values files alone"; else fail "empty overrides change the release"; fi
+ov_expect "variables context unavailable (null): nothing is overridden" '{}' dev 'null'
+ov_expect "unrelated variables (deployment switch) are ignored" '{}' dev '{"K8S_DEV_DEPLOY_ENABLED":"true","OTHER":"x"}'
+ov_expect "empty variable: the values file is kept" '{}' dev '{"DEV_DB_HOST":""}'
+
+ov_expect "DEV_DB_HOST overrides only config.DB_HOST" '{"config":{"DB_HOST":"pg.override.example.test"}}' dev '{"DEV_DB_HOST":"pg.override.example.test"}'
+got="$(render_ov dev | config_of)"; want="$(echo "$base_dev" | config_of | jq -c '.DB_HOST = "pg.override.example.test"')"
+if [ "$got" = "$want" ] && [ "$(render_ov dev | yq 'select(.kind != "ConfigMap" and .kind != "Deployment")' )" = "$(echo "$base_dev" | yq 'select(.kind != "ConfigMap" and .kind != "Deployment")')" ]; then
+  pass "DEV: only DB_HOST differs in the ConfigMap; APP_ENV, DB_PORT and every other object are unchanged"
+else
+  fail "DEV override changed something else"; echo "$got"
+fi
+ov_expect "a DEV variable does not reach STAGE" '{}' stage '{"DEV_DB_HOST":"pg.override.example.test"}'
+if [ "$(render_ov stage)" = "$base_stage" ]; then pass "STAGE release is unchanged by DEV variables"; else fail "DEV variable changed STAGE"; fi
+ov_expect "STAGE_DB_HOST overrides only STAGE" '{"config":{"DB_HOST":"pg.stage-override.example.test"}}' stage '{"STAGE_DB_HOST":"pg.stage-override.example.test","DEV_DB_HOST":"pg.override.example.test"}'
+if [ "$(render_ov stage | config_of | jq -r .DB_HOST)" = "pg.stage-override.example.test" ] && [ "$(render_ov stage | config_of | jq -r .APP_URL)" = "https://api.stage.example.test" ]; then
+  pass "STAGE: DB_HOST from the variable, APP_URL from values-stage.yaml"
+else
+  fail "STAGE override"
+fi
+ov_expect "a STAGE variable does not reach DEV" '{}' dev '{"STAGE_DB_HOST":"pg.stage-override.example.test"}'
+
+ov_expect "types: url, integer and boolean are validated and stored as ConfigMap strings" \
+  '{"config":{"APP_URL":"https://api.other.example.test/base","DB_POOL_SIZE":"12","FEATURE_PREVIEW":"true","SERVICE_LABEL":"blue green"}}' \
+  dev '{"DEV_APP_URL":"https://api.other.example.test/base","DEV_DB_POOL_SIZE":"12","DEV_FEATURE_PREVIEW":"true","DEV_SERVICE_LABEL":"blue green"}'
+if render_ov dev >/dev/null 2>"$WORK/ov-render.log"; then pass "typed overrides pass the chart schema"; else fail "typed overrides rejected by the chart"; cat "$WORK/ov-render.log"; fi
+ov_reject "integer variable with text" "not an integer" dev '{"DEV_DB_POOL_SIZE":"twelve"}'
+ov_reject "boolean variable 'yes'" "must be true or false" dev '{"DEV_FEATURE_PREVIEW":"yes"}'
+ov_reject "url variable without http(s)" "not an http(s) URL" dev '{"DEV_APP_URL":"javascript:alert(1)"}'
+ov_reject "host variable with shell text" "not a host name or address" dev '{"DEV_DB_HOST":"a; rm -rf /"}'
+ov_reject "variable with a line break" "control characters" dev "$(printf '{"DEV_SERVICE_LABEL":"a\\nb"}')"
+ov_reject "variable of this environment that is not allowed" "DEV_FEATURE_WRITES_ENABLED are not listed" dev '{"DEV_FEATURE_WRITES_ENABLED":"true"}'
+ov_reject "variable aimed at a credential" "DEV_DB_PASSWORD are not listed" dev '{"DEV_DB_PASSWORD":"x"}'
+
+bad_allow() {  # label, expected text, overrides.yaml body
+  local label="$1" text="$2" dir="$WORK/ov-bad"
+  rm -rf "$dir"; mkdir -p "$dir/deploy"; printf '%s\n' "$3" >"$dir/deploy/overrides.yaml"
+  ov_reject "$label" "$text" dev '{"DEV_X":"1"}' "$dir"
+}
+bad_allow "allow-list entry for the image digest" "only config.<NAME> can be overridden" 'overrides: { X: { path: image.digest } }'
+bad_allow "allow-list entry for replicas" "only config.<NAME> can be overridden" 'overrides: { X: { path: components.web.replicas, type: integer } }'
+bad_allow "allow-list entry for Secret references" "only config.<NAME> can be overridden" 'overrides: { X: { path: envFromSecrets } }'
+bad_allow "allow-list entry for a component (nested path)" "only config.<NAME> can be overridden" 'overrides: { X: { path: config.A.b } }'
+bad_allow "allow-list entry for the security context" "only config.<NAME> can be overridden" 'overrides: { X: { path: podSecurity.runAsUser, type: integer } }'
+bad_allow "allow-list entry for a password" "looks like a credential" 'overrides: { X: { path: config.DB_PASSWORD } }'
+bad_allow "allow-list entry for an API token" "looks like a credential" 'overrides: { X: { path: config.PARTNER_API_TOKEN } }'
+bad_allow "allow-list entry with an unknown type" "unknown type" 'overrides: { X: { path: config.X, type: json } }'
+bad_allow "allow-list entry with extra keys" "only path and type are allowed" 'overrides: { X: { path: config.X, default: "1" } }'
+bad_allow "allow-list with another top-level key" 'only the top-level key "overrides" is allowed' 'namespace: other'
+
+mkdir -p "$WORK/ov-none/deploy"
+ov_expect "service without overrides.yaml: mechanism is inactive even if DEV_* variables exist" '{}' dev '{"DEV_ANYTHING":"x"}' "$WORK/ov-none"
+
+resolve_overrides dev '{"DEV_DB_HOST":"pg.override.example.test"}'
+if [ "$(jq -c 'keys' "$WORK/overrides.json")" = '["config"]' ] && ! grep -qiE 'password|secret|token' "$WORK/overrides.json" \
+   && [ ! -e "$WORK/repository-variables.json" ]; then
+  pass "the generated file contains only the config key, no credentials; the variables dump is removed"
+else
+  fail "generated overrides content"
+fi
+# the deploy job receives the validated JSON through a job output and writes it unchanged
+apply_step="$(yq '.jobs.deploy.steps[] | select(.name == "Apply variable overrides") | .run' "$dk")"
+mkdir -p "$WORK/deploy-side"
+env -i PATH="$PATH" RUNNER_TEMP="$WORK/deploy-side" OVERRIDES="$(ov_json)" bash -c "$apply_step"
+env -i PATH="$PATH" RUNNER_TEMP="$WORK/deploy-side-empty" OVERRIDES="" bash -c "mkdir -p \"\$RUNNER_TEMP\"; $apply_step"
+# shellcheck disable=SC2016  # literal GitHub expressions
+if [ "$(jq -c . "$WORK/deploy-side/overrides.json")" = "$(jq -c . "$WORK/overrides.json")" ] && [ "$(jq -c . "$WORK/deploy-side-empty/overrides.json")" = '{}' ] \
+   && [ "$(yq '.jobs.validate.outputs.overrides' "$dk")" = '${{ steps.overrides.outputs.json }}' ] \
+   && [ "$(yq '.jobs.deploy.steps[] | select(.name == "Apply variable overrides") | .env.OVERRIDES' "$dk")" = '${{ needs.validate.outputs.overrides }}' ]; then
+  pass "deploy job applies exactly the JSON the validate job resolved (empty -> {})"
+else
+  fail "overrides hand-over between validate and deploy"
+fi
+uses_values="$(yq '[.jobs[].steps[] | select(.run != null) | .run | select(test("values-\\$\\{ENVIRONMENT\\}.yaml\"")) | select(test("helm (template|\"\\$\\{args)") or test("upgrade --install"))] | length' "$dk")"
+# shellcheck disable=SC2016  # literal shell text of the workflow
+uses_overrides="$(grep -c -- '-f "${RUNNER_TEMP}/overrides.json"' "$dk")"
+# shellcheck disable=SC2016
+if [ "$uses_overrides" = "3" ] && [ "$(grep -c -- '-f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"' "$dk")" = "3" ]; then
+  pass "validation render, migration render and helm upgrade all load values.yaml, values-<env>.yaml, then the overrides ($uses_values steps)"
+else
+  fail "overrides are not applied in every helm invocation ($uses_overrides of 3)"
+fi
+if yq '.jobs[].steps[] | select(.run != null) | .run' "$dk" | grep -nE '\$\{\{ *(vars|toJSON)' >"$WORK/interp.log"; then
+  fail "repository variables must not be interpolated into a script"; cat "$WORK/interp.log"
+else
+  pass "repository variables reach the script only as data (environment variable with JSON)"
+fi
+if [ "$(render_ov dev | yq 'select(.kind == "Deployment") | .spec.template.spec.containers[0].image')" = "$(echo "$base_dev" | yq 'select(.kind == "Deployment") | .spec.template.spec.containers[0].image')" ] \
+   && [ "$(render_ov dev | yq 'select(.kind == "Deployment") | [.spec.template.spec.containers[0].envFrom[] | select(.secretRef != null) | .secretRef.name] | join(",")' | tr -d '\n')" = "example-app" ]; then
+  pass "image digest and Secret references are untouched by overrides"
+else
+  fail "overrides changed the image or the Secret references"
+fi
+
 echo "== branch model: Kubernetes workflows next to the existing deployment"
 bm="$WORK/branch-model"; mkdir -p "$bm/ok"
 cp tests/branch-model/legacy/deploy.yml "${templates[@]}" "$bm/ok/"
