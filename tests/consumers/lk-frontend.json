@@ -1,0 +1,95 @@
+{
+ "workflows": {
+  "k8s-build.yml": {
+   "calls": [
+    {
+     "if": null,
+     "job": "validate",
+     "outputs_read": [],
+     "permissions": {
+      "contents": "read",
+      "packages": "read"
+     },
+     "ref": "9f60ede0218420b51f61daeb75cc74218c47c0ca",
+     "secrets": {},
+     "uses": "deploy-k8s.yml",
+     "with": {
+      "chart-version": "0.1.0",
+      "environment": "${{ startsWith(github.ref_name, 'stage-k8s/') && 'stage' || 'dev' }}",
+      "validate-only": true
+     }
+    },
+    {
+     "if": null,
+     "job": "image",
+     "outputs_read": [
+      "digest"
+     ],
+     "permissions": {
+      "contents": "read",
+      "packages": "write"
+     },
+     "ref": "9f60ede0218420b51f61daeb75cc74218c47c0ca",
+     "secrets": {},
+     "uses": "build-image.yml",
+     "with": {
+      "push": "${{ github.ref == 'refs/heads/dev-k8s/release' || github.ref == 'refs/heads/stage-k8s/release' }}"
+     }
+    },
+    {
+     "if": "github.ref == 'refs/heads/dev-k8s/release' && vars.K8S_DEV_DEPLOY_ENABLED == 'true'",
+     "job": "deploy-dev",
+     "outputs_read": [],
+     "permissions": {
+      "contents": "read",
+      "packages": "read"
+     },
+     "ref": null,
+     "secrets": {},
+     "uses": "./.github/workflows/k8s-deploy.yml",
+     "with": {
+      "digest": "${{ needs.image.outputs.digest }}"
+     }
+    }
+   ],
+   "interface": null
+  },
+  "k8s-deploy.yml": {
+   "calls": [
+    {
+     "if": "github.ref == 'refs/heads/dev-k8s/release' && vars.K8S_DEV_DEPLOY_ENABLED == 'true'",
+     "job": "deploy-dev",
+     "outputs_read": [],
+     "permissions": {
+      "contents": "read",
+      "packages": "read"
+     },
+     "ref": "9f60ede0218420b51f61daeb75cc74218c47c0ca",
+     "secrets": {},
+     "uses": "deploy-k8s.yml",
+     "with": {
+      "chart-version": "0.1.0",
+      "environment": "dev",
+      "image-digest": "${{ inputs.digest }}",
+      "restart": "${{ inputs.restart }}"
+     }
+    }
+   ],
+   "interface": {
+    "inputs": {
+     "digest": {
+      "default": null,
+      "required": true,
+      "type": "string"
+     },
+     "restart": {
+      "default": false,
+      "required": false,
+      "type": "boolean"
+     }
+    },
+    "secrets": {}
+   }
+  }
+ }
+}

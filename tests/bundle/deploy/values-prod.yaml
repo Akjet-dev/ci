@@ -1,0 +1,7 @@
+# Name resolution only: deploy-k8s.yml refuses this environment.
+config:
+  APP_ENV: production
+  DB_USERNAME: example_prod_app
+requiredSecrets:
+  integrations: [PARTNER_API_TOKEN, PARTNER_LOGIN]
+envFromSecrets: [app, integrations]

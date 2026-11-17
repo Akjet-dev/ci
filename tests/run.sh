@@ -176,9 +176,10 @@ case " $inputs " in
   *" namespace "*|*runner*|*" branch "*|*" service "*|*" kubeconfig "*|*" cluster "*) fail "deploy-k8s.yml exposes an input that selects the target: $inputs" ;;
   *) pass "no input selects the namespace, the runner, the cluster or the deployment branch ($inputs)" ;;
 esac
-if [ "$(yq '.on.workflow_call.secrets // {} | keys | join(",")' "$dk")" = "app-secrets" ] \
-   && [ "$(yq '.on.workflow_call.secrets.app-secrets.required' "$dk")" = "false" ]; then
-  pass "deploy-k8s.yml accepts exactly one secret, the optional app-secrets"
+if [ "$(yq '.on.workflow_call.secrets // {} | keys | join(",")' "$dk")" = "app-secrets,env-bundle" ] \
+   && [ "$(yq '.on.workflow_call.secrets.app-secrets.required' "$dk")" = "false" ] \
+   && [ "$(yq '.on.workflow_call.secrets.env-bundle.required' "$dk")" = "false" ]; then
+  pass "deploy-k8s.yml accepts exactly two secrets, both optional: app-secrets and env-bundle"
 else
   fail "deploy-k8s.yml: secrets contract"
 fi
@@ -231,7 +232,7 @@ run_resolve() {
     RUNNER_LABEL="$runner_label" DEV_DEPLOY_BRANCH="$deploy_branch" \
     ENVIRONMENT="$1" GITHUB_REF="$2" GITHUB_EVENT_NAME="$3" VALIDATE_ONLY="$4" DIGEST="${5-$good_digest}" \
     RELEASE_INPUT="${6:-}" VALUES_DIR="${7:-deploy}" CHART_INPUT="${8:-}" CHART_VERSION="${10:-1.2.3}" \
-    APP_SECRETS_SUPPLIED="${11:-false}" \
+    APP_SECRETS_SUPPLIED="${11:-false}" ENV_BUNDLE_SUPPLIED="${12:-false}" \
     TIMEOUT="10m" DEPLOY_ENABLED="true" bash -c "$resolve" >"$WORK/resolve.log" 2>&1
 }
 out() { grep -qx "$1" "$WORK/gh_output"; }
@@ -543,7 +544,7 @@ bad_allow "allow-list entry for a password" "looks like a credential" 'overrides
 bad_allow "allow-list entry for an API token" "looks like a credential" 'overrides: { X: { path: config.PARTNER_API_TOKEN } }'
 bad_allow "allow-list entry with an unknown type" "unknown type" 'overrides: { X: { path: config.X, type: json } }'
 bad_allow "allow-list entry with extra keys" "only path and type are allowed" 'overrides: { X: { path: config.X, default: "1" } }'
-bad_allow "allow-list with another top-level key" 'only the top-level key "overrides" is allowed' 'namespace: other'
+bad_allow "allow-list with another top-level key" 'only the top-level keys "overrides", "secrets" and "locked" are allowed' 'namespace: other'
 
 mkdir -p "$WORK/ov-none/deploy"
 ov_expect "service without overrides.yaml: mechanism is inactive even if DEV_* variables exist" '{}' dev '{"DEV_ANYTHING":"x"}' "$WORK/ov-none"
@@ -760,6 +761,423 @@ for tpl in "${templates[@]}"; do
   if grep -qE 'secrets: *inherit' "$tpl"; then fail "$tpl uses secrets: inherit"; fi
 done
 pass "no template passes secrets wholesale (secrets: inherit)"
+
+echo "== deploy-k8s.yml: environment bundle (env-bundle)"
+bn_src=tests/bundle
+bn_step="$(yq '.jobs.validate.steps[] | select(.id == "bundle") | .run' "$dk")"
+# shellcheck disable=SC2016  # literal workflow text
+if [ "$(grep -c 'secrets\.env-bundle' "$dk")" = "3" ] \
+   && [ "$(yq '.jobs.validate.steps[0].env.ENV_BUNDLE_SUPPLIED' "$dk")" = '${{ secrets.env-bundle != '"''"' }}' ] \
+   && [ "$(yq '[.jobs.validate.steps[] | select(.env.ENV_BUNDLE != null) | .id] | join(",")' "$dk")" = "bundle" ] \
+   && [ "$(yq '[.jobs.deploy.steps[] | select(.env.ENV_BUNDLE != null) | .id] | join(",")' "$dk")" = "secrets" ]; then
+  pass "the bundle reaches exactly two steps: the check (validate job) and the Secret provisioning (deploy job)"
+else
+  fail "where env-bundle is referenced"
+fi
+if grep -qE 'toJSON\(secrets\)|secrets: *inherit' "$dk" "${templates[@]}"; then
+  fail "a workflow serializes the secrets context or inherits all secrets"
+else
+  pass "no workflow serializes the secrets context or passes secrets wholesale"
+fi
+if grep -qE 'GITHUB_STEP_SUMMARY|set -x|tee ' <<<"$bn_step"; then
+  fail "the bundle check writes to the summary or traces commands"
+else
+  pass "the bundle check writes nothing to the summary and has no command trace"
+fi
+reject "env-bundle passed to a validation-only run" dev refs/heads/dev-k8s/feature-x push true "" "" deploy "" Akjet-dev/backend "" false true
+reject "env-bundle passed to stage validation" stage refs/heads/stage-k8s/release push true "" "" deploy "" Akjet-dev/backend "" false true
+reject "env-bundle together with app-secrets" "${rel[@]}" "" deploy "" Akjet-dev/backend "" true true
+accept "env-bundle passed to the deploying run" "deploy=true" "${rel[@]}" "" deploy "" Akjet-dev/backend "" false true
+
+bundle_check() {  # environment, bundle text, [directory with deploy/]
+  : >"$WORK/bn_output"; rm -f "$WORK/bundle-config.json"
+  ( cd "${3:-$bn_src}" && env -i PATH="$PATH" RUNNER_TEMP="$WORK" GITHUB_OUTPUT="$WORK/bn_output" \
+      ENVIRONMENT="$1" VALUES_DIR=deploy ENV_BUNDLE="$2" bash --noprofile --norc -c "$bn_step" ) </dev/null >"$WORK/bn.log" 2>&1
+}
+bn_plan() { sed -n 's/^plan=//p' "$WORK/bn_output"; }
+bn_expect() {  # label, expected plan, expected config JSON, environment, bundle
+  local label="$1" plan="$2" cfg="$3"; shift 3
+  if bundle_check "$@" && [ "$(bn_plan)" = "$plan" ] && [ "$(jq -cS . "$WORK/bundle-config.json")" = "$cfg" ]; then pass "$label"
+  else fail "$label: plan='$(bn_plan)' config='$(cat "$WORK/bundle-config.json" 2>/dev/null)'"; cat "$WORK/bn.log"; fi
+}
+bn_reject() {  # label, expected text, environment, bundle, [dir]
+  local label="$1" text="$2"; shift 2
+  if bundle_check "$@"; then fail "accepted: $label"
+  elif grep -qF -- "$text" "$WORK/bn.log"; then pass "rejected: $label"
+  else fail "rejected for another reason: $label"; cat "$WORK/bn.log"; fi
+}
+bn_json() { jq -cn "$@"; }   # builds test bundles; values never appear on a command line of the step under test
+
+bn_expect "no bundle: nothing is planned, values files are used as they are" "" '{}' dev ""
+# A multi-line value with quotes, a backslash, shell metacharacters and non-ASCII text.
+# shellcheck disable=SC2016  # literal text with shell metacharacters, on purpose
+cert="$(printf -- '-----BEGIN KEY-----\nline "two" $HOME `id` \\ end\nтретья строка: ключ ✓\n-----END KEY-----\n')"
+pw_app='App-Pässwörd=1"; echo pwned'
+pw_mig='Migrator-0nly/секрет'
+# shellcheck disable=SC2016  # jq program
+good_dev="$(bn_json --arg c "$cert" --arg a "$pw_app" --arg m "$pw_mig" '{DEV_APP_KEY: "base64:QUJDRA==", DEV_DB_PASSWORD: $a, DEV_DB_MIGRATOR_PASSWORD: $m, DEV_PARTNER_CERTIFICATE: $c, DEV_DB_HOST: "db.bundle.example.test", DEV_APP_URL: ""}')"
+bn_expect "dev bundle: Secret keys are planned by name, configuration goes to the overrides step, empty values are ignored" \
+  "app.APP_KEY=APP_KEY app.DB_PASSWORD=DB_PASSWORD app.PARTNER_CERTIFICATE=PARTNER_CERTIFICATE migrate.DB_PASSWORD=DB_MIGRATOR_PASSWORD" \
+  '{"DEV_DB_HOST":"db.bundle.example.test"}' dev "$good_dev"
+if ! grep -qF -e "$pw_app" -e "$pw_mig" -e 'третья строка' -e 'QUJDRA' "$WORK/bn.log" "$WORK/bn_output" "$WORK/bundle-config.json" \
+   && ! grep -rqF -e "$pw_mig" -e 'третья строка' "$WORK"/bundle-*.json; then
+  pass "the bundle check prints and stores no secret value (log, outputs, intermediate files)"
+else
+  fail "a secret value leaked from the bundle check"
+fi
+if grep -qF 'Secret keys from the bundle: app.APP_KEY, app.DB_PASSWORD, app.PARTNER_CERTIFICATE, migrate.DB_PASSWORD' "$WORK/bn.log" \
+   && grep -qF 'Configuration overrides from the bundle: DB_HOST' "$WORK/bn.log" && grep -qE '^env-bundle: [0-9]+ bytes' "$WORK/bn.log"; then
+  pass "the bundle check reports names and the size only"
+else
+  fail "report of the bundle check"; cat "$WORK/bn.log"
+fi
+to_env() { jq -c --arg from "DEV_" --arg to "$1" 'with_entries(.key |= ($to + ltrimstr($from)))' <<<"$good_dev"; }
+bn_expect "stage: the same names resolve with the STAGE_ prefix" \
+  "app.APP_KEY=APP_KEY app.DB_PASSWORD=DB_PASSWORD app.PARTNER_CERTIFICATE=PARTNER_CERTIFICATE migrate.DB_PASSWORD=DB_MIGRATOR_PASSWORD" \
+  '{"STAGE_DB_HOST":"db.bundle.example.test"}' stage "$(to_env STAGE_)"
+# shellcheck disable=SC2016  # jq program
+bn_expect "a third environment resolves with its own prefix; Secrets declared only there are accepted" \
+  "app.APP_KEY=APP_KEY app.DB_PASSWORD=DB_PASSWORD app.PARTNER_CERTIFICATE=PARTNER_CERTIFICATE migrate.DB_PASSWORD=DB_MIGRATOR_PASSWORD integrations.PARTNER_API_TOKEN=PARTNER_API_TOKEN" \
+  '{"PROD_DB_HOST":"db.bundle.example.test","PROD_PARTNER_API_URL":"https://partner.example.test"}' prod \
+  "$(to_env PROD_ | jq -c '. + {PROD_PARTNER_API_TOKEN: "t0ken", PROD_PARTNER_API_URL: "https://partner.example.test"}')"
+bn_reject "dev: a Secret declared only for stage" "PARTNER_API_TOKEN is declared neither in requiredSecrets" dev "$(jq -c '. + {DEV_PARTNER_API_TOKEN: "x"}' <<<"$good_dev")"
+bn_reject "dev run with the stage bundle (no cross-environment fallback)" "STAGE_DB_PASSWORD does not start with DEV_" dev "$(to_env STAGE_)"
+if grep -qF 'DEV_DB_PASSWORD is required' "$WORK/bn.log" && ! grep -qF -e "$pw_app" -e "$pw_mig" "$WORK/bn.log"; then
+  pass "  ... and the credentials of the other environment are neither used nor printed"
+else
+  fail "cross-environment bundle handling"; cat "$WORK/bn.log"
+fi
+bn_reject "one key of another environment inside the dev bundle" "STAGE_DB_HOST does not start with DEV_" dev "$(jq -c '. + {STAGE_DB_HOST: "db.other.example.test"}' <<<"$good_dev")"
+bn_reject "a required Secret key is missing" "DEV_DB_PASSWORD is required (key of Secret app.DB_PASSWORD)" dev "$(jq -c 'del(.DEV_DB_PASSWORD)' <<<"$good_dev")"
+bn_reject "a required Secret key is empty" "DEV_APP_KEY is required" dev "$(jq -c '.DEV_APP_KEY = ""' <<<"$good_dev")"
+bn_reject "the migration password is missing (no fallback to the application password)" "DEV_DB_MIGRATOR_PASSWORD is required (key of Secret migrate.DB_PASSWORD)" dev "$(jq -c 'del(.DEV_DB_MIGRATOR_PASSWORD)' <<<"$good_dev")"
+bn_expect "an optional Secret key may be absent" "app.APP_KEY=APP_KEY app.DB_PASSWORD=DB_PASSWORD migrate.DB_PASSWORD=DB_MIGRATOR_PASSWORD" '{"DEV_DB_HOST":"db.bundle.example.test"}' dev "$(jq -c 'del(.DEV_PARTNER_CERTIFICATE)' <<<"$good_dev")"
+bn_reject "not JSON" "env-bundle is not a JSON object" dev 'DEV_DB_PASSWORD=super-secret-not-json'
+if grep -q 'super-secret-not-json' "$WORK/bn.log"; then fail "invalid JSON is echoed"; else pass "  ... and the unparsable content is not echoed"; fi
+bn_reject "a JSON array instead of an object" "env-bundle is not a JSON object" dev '["DEV_DB_PASSWORD"]'
+bn_reject "a number instead of a string" "DEV_DB_PORT: the value must be a JSON string, not number" dev "$(jq -c '. + {DEV_DB_PORT: 5432}' <<<"$good_dev")"
+bn_reject "a nested object instead of a string" "DEV_DB_PASSWORD: the value must be a JSON string, not object" dev "$(jq -c '.DEV_DB_PASSWORD = {a: "b"}' <<<"$good_dev")"
+bn_reject "null instead of a string" "DEV_APP_KEY: the value must be a JSON string, not null" dev "$(jq -c '.DEV_APP_KEY = null' <<<"$good_dev")"
+bn_reject "a key with an invalid name" "has an invalid name" dev "$(jq -c '. + {"DEV_db-host; rm -rf": "x"}' <<<"$good_dev")"
+if grep -q 'rm -rf' "$WORK/bn.log"; then fail "an invalid key is echoed"; else pass "  ... and the invalid key is not echoed"; fi
+bn_reject "a key without the environment prefix" "a key does not start with DEV_" dev "$(jq -c '. + {"db_password": "x"}' <<<"$good_dev")"
+bn_reject "configuration that the service did not make overridable" "LOG_CHANNEL is set in the values files and is not listed under overrides" dev "$(jq -c '. + {DEV_LOG_CHANNEL: "stack"}' <<<"$good_dev")"
+bn_reject "a name nobody declared" "WHATEVER is declared neither in requiredSecrets" dev "$(jq -c '. + {DEV_WHATEVER: "x"}' <<<"$good_dev")"
+bn_reject "a name locked for dev (safety switch)" "FEATURE_WRITES_ENABLED is locked for dev" dev "$(jq -c '. + {DEV_FEATURE_WRITES_ENABLED: "true"}' <<<"$good_dev")"
+bn_reject "an endpoint locked for dev" "PARTNER_API_URL is locked for dev" dev "$(jq -c '. + {DEV_PARTNER_API_URL: "https://partner.example.test"}' <<<"$good_dev")"
+bn_expect "the same switch is not locked for stage" "app.APP_KEY=APP_KEY app.DB_PASSWORD=DB_PASSWORD app.PARTNER_CERTIFICATE=PARTNER_CERTIFICATE migrate.DB_PASSWORD=DB_MIGRATOR_PASSWORD" \
+  '{"STAGE_DB_HOST":"db.bundle.example.test","STAGE_FEATURE_WRITES_ENABLED":"true"}' stage "$(to_env STAGE_ | jq -c '. + {STAGE_FEATURE_WRITES_ENABLED: "true"}')"
+bn_noalias="$WORK/bn-noalias"; rm -rf "$bn_noalias"; mkdir -p "$bn_noalias"; cp -R "$bn_src/deploy" "$bn_noalias/"; yq -i 'del(.secrets.aliases)' "$bn_noalias/deploy/overrides.yaml"
+bn_reject "one bundle name for two Secret keys (application and migration password) without an alias" "DB_PASSWORD is the bundle name of more than one Secret key (app.DB_PASSWORD, migrate.DB_PASSWORD)" dev "$good_dev" "$bn_noalias"
+
+# precedence: values file < repository variable < bundle; both are validated by the overrides step
+bn_overrides() {  # environment, repository variables JSON -> overrides JSON (after bundle_check)
+  : >"$WORK/ov_output"
+  ( cd "$bn_src" && env -i PATH="$PATH" RUNNER_TEMP="$WORK" GITHUB_OUTPUT="$WORK/ov_output" GITHUB_STEP_SUMMARY="$WORK/ov_summary" \
+      ENVIRONMENT="$1" VALUES_DIR=deploy REPOSITORY_VARIABLES="$2" bash --noprofile --norc -c "$ov_step" ) </dev/null >"$WORK/ov.log" 2>&1 && ov_json
+}
+bundle_check dev "$good_dev"
+if [ "$(bn_overrides dev '{"DEV_DB_HOST":"db.variable.example.test","DEV_DB_PORT":"6000"}')" = '{"config":{"DB_HOST":"db.bundle.example.test","DB_PORT":"6000"}}' ]; then
+  pass "precedence: the bundle wins over a repository variable; a variable still applies where the bundle is silent"
+else
+  fail "precedence bundle / variable: $(ov_json)"; cat "$WORK/ov.log"
+fi
+bn_render() { "$HELM" template example-api "$CHART" --namespace dev-example-api -f "$bn_src/deploy/values.yaml" -f "$bn_src/deploy/values-$1.yaml" -f "$WORK/overrides.json" "${@:2}"; }
+if [ "$(bn_render dev | yq 'select(.kind == "ConfigMap") | .data.DB_HOST + " " + .data.DB_PORT + " " + .data.DB_USERNAME')" = "db.bundle.example.test 6000 example_dev_app" ]; then
+  pass "precedence: the rendered ConfigMap carries bundle > variable > values file"
+else
+  fail "rendered precedence"
+fi
+bundle_check dev "$(jq -c 'del(.DEV_DB_HOST)' <<<"$good_dev")"
+if [ "$(bn_overrides dev '{}')" = '{}' ] && [ "$(bn_render dev | yq 'select(.kind == "ConfigMap") | .data.DB_HOST')" = "db.default.example.test" ]; then
+  pass "fallback: without an override the value of the values file is used"
+else
+  fail "fallback to the values file"
+fi
+bundle_check dev "$(jq -c '.DEV_DB_PORT = "not-a-number"' <<<"$good_dev")"
+if bn_overrides dev '{}' >/dev/null; then fail "an invalid type from the bundle was accepted"
+elif grep -qF 'variable DEV_DB_PORT: not an integer' "$WORK/ov.log"; then pass "configuration from the bundle is type-checked like a repository variable"
+else fail "type check of bundle configuration"; cat "$WORK/ov.log"; fi
+rm -f "$WORK/bundle-config.json"
+if bn_overrides dev '{"DEV_FEATURE_WRITES_ENABLED":"true"}' >/dev/null; then fail "a locked name was accepted from a repository variable"
+elif grep -qF 'FEATURE_WRITES_ENABLED is locked for dev' "$WORK/ov.log"; then pass "a locked name is refused from a repository variable too"
+else fail "locked name from a variable"; cat "$WORK/ov.log"; fi
+if [ "$(bn_overrides stage '{"STAGE_FEATURE_WRITES_ENABLED":"true"}')" = '{"config":{"FEATURE_WRITES_ENABLED":"true"}}' ]; then
+  pass "  ... while the environment that does not lock it accepts it"
+else
+  fail "locked list is per environment"; cat "$WORK/ov.log"
+fi
+
+# deploy side: only names cross between the jobs; values go from the bundle straight into kubectl's stdin
+bundle_check dev "$good_dev"; bn_good_plan="$(bn_plan)"
+bn_declared="app.APP_KEY app.DB_PASSWORD app.PARTNER_CERTIFICATE migrate.DB_PASSWORD"
+provision_bundle() {  # bundle, plan, [declared], [denied], [app-secrets]
+  : >"$WORK/sec_output"
+  env -i PATH="$fakebin:$PATH" GITHUB_OUTPUT="$WORK/sec_output" RUNNER_TEMP="$WORK" FAKE_STATE="$sec_state" FAKE_DENY="${4:-}" \
+    NAMESPACE=dev-example-api RELEASE=example-api VALUES_DIR=deploy ENVIRONMENT=dev \
+    ENV_BUNDLE="$1" PLAN="$2" DECLARED="${3-$bn_declared}" APP_SECRETS="${5:-}" bash --noprofile --norc -c "$sec_step" </dev/null >"$WORK/sec.log" 2>&1
+}
+bnp_reject() {  # label, expected text, provision_bundle args...
+  local label="$1" text="$2"; shift 2
+  if provision_bundle "$@"; then fail "accepted: $label"
+  elif ! grep -qF -- "$text" "$WORK/sec.log"; then fail "rejected for another reason: $label"; grep -v '^::add-mask::' "$WORK/sec.log"
+  elif grep -q ' apply ' "$sec_state/calls.log"; then fail "$label: a Secret was written before the failure"
+  else pass "rejected, nothing written: $label"; fi
+}
+sec_reset example-api-app example-api-migrate
+if provision_bundle "$good_dev" "$bn_good_plan" && [ "$(cat "$WORK/sec_output")" = "changed=true" ] \
+   && [ "$(sec_data example-api-app DB_PASSWORD)" = "$pw_app" ] && [ "$(sec_data example-api-app APP_KEY)" = "base64:QUJDRA==" ] \
+   && [ "$(jq -r '.PARTNER_CERTIFICATE | @base64d' "$sec_state/example-api-app.json"; echo x)" = "$(printf '%s\nx' "$cert")" ]; then
+  pass "bundle values reach the Secret byte for byte: multi-line, quotes, backslash, shell metacharacters, non-ASCII"
+else
+  fail "provisioning from the bundle"; grep -v '^::add-mask::' "$WORK/sec.log"; cat "$sec_state/calls.log"
+fi
+if [ "$(sec_data example-api-migrate DB_PASSWORD)" = "$pw_mig" ] && [ "$(jq -c 'keys' "$sec_state/example-api-migrate.json")" = '["DB_PASSWORD"]' ] \
+   && [ "$(sec_data example-api-app DB_PASSWORD)" != "$pw_mig" ]; then
+  pass "migration credentials: <ENV>_DB_MIGRATOR_PASSWORD becomes DB_PASSWORD of the migrate Secret; the application password is not mixed in"
+else
+  fail "migration credentials from the bundle"
+fi
+if [ "$(jq -c 'keys' "$sec_state/example-api-app.json")" = '["APP_KEY","DB_PASSWORD","PARTNER_CERTIFICATE"]' ]; then
+  pass "the applied manifest lists exactly the planned keys (server-side apply leaves every other key of the Secret alone)"
+else
+  fail "keys of the applied manifest: $(jq -c 'keys' "$sec_state/example-api-app.json")"
+fi
+if ! grep -v '^::add-mask::' "$WORK/sec.log" | grep -qF -e "$pw_app" -e "$pw_mig" -e 'третья строка' -e 'QUJDRA' \
+   && ! grep -qF -e "$pw_app" -e "$pw_mig" -e 'третья строка' "$WORK/sec_output" "$sec_state/calls.log" \
+   && ! grep -qF "$(printf '%s' "$pw_mig" | base64 | tr -d '\n')" "$WORK/sec.log" "$sec_state/calls.log" \
+   && grep -qF -- "::add-mask::$pw_mig" "$WORK/sec.log" && grep -qF '::add-mask::третья строка: ключ ✓' "$WORK/sec.log" \
+   && [ ! -e "$WORK/app-secrets-changed" ] && ! grep -qsF -e "$pw_mig" -e "$pw_app" "$WORK"/*.json; then
+  pass "values appear only in masking commands (every line of a multi-line value is masked); not in logs, outputs, command lines or files"
+else
+  fail "a bundle value leaked on the deploy side"; grep -v '^::add-mask::' "$WORK/sec.log"
+fi
+if provision_bundle "$good_dev" "$bn_good_plan" && [ "$(cat "$WORK/sec_output")" = "changed=false" ]; then
+  pass "an unchanged bundle modifies nothing and requests no restart"
+else
+  fail "second run with the same bundle"; cat "$WORK/sec_output"
+fi
+if provision_bundle "$(jq -c '.DEV_DB_PASSWORD = "rotated"' <<<"$good_dev")" "$bn_good_plan" && [ "$(cat "$WORK/sec_output")" = "changed=true" ] \
+   && [ "$(sec_data example-api-app DB_PASSWORD)" = "rotated" ] && [ "$(sec_data example-api-migrate DB_PASSWORD)" = "$pw_mig" ]; then
+  pass "a rotated value updates its Secret and requests a restart of the pods"
+else
+  fail "rotation through the bundle"
+fi
+: >"$sec_state/calls.log"
+if provision_bundle '{"DEV_DB_HOST":"db.bundle.example.test"}' "" && [ "$(cat "$WORK/sec_output")" = "changed=false" ] && [ ! -s "$sec_state/calls.log" ]; then
+  pass "a bundle with configuration only leaves Kubernetes Secrets alone"
+else
+  fail "bundle without Secret keys"
+fi
+sec_reset example-api-app example-api-migrate
+bnp_reject "the bundle lost a planned key between the jobs" "does not contain every key planned" "$(jq -c 'del(.DEV_DB_MIGRATOR_PASSWORD)' <<<"$good_dev")" "$bn_good_plan"
+bnp_reject "a planned key that the values do not declare" "app.STRIPE_KEY is not declared in requiredSecrets" "$good_dev" "$bn_good_plan app.STRIPE_KEY=DB_PASSWORD"
+# shellcheck disable=SC2016  # a literal attempt at command injection
+bnp_reject "a malformed plan" "plan of the validate job is malformed" "$good_dev" 'app.DB_PASSWORD=$(id)'
+bnp_reject "the runner may not patch one of the Secrets (checked before the first write)" "may not patch Secret example-api-migrate" "$good_dev" "$bn_good_plan" "$bn_declared" "patch:example-api-migrate"
+bnp_reject "env-bundle and app-secrets in one run" "pass either env-bundle or app-secrets" "$good_dev" "$bn_good_plan" "$bn_declared" "" "app.DB_PASSWORD=x"
+sec_reset example-api-app
+bnp_reject "a Secret object the platform has not created" "Secret example-api-migrate does not exist" "$good_dev" "migrate.DB_PASSWORD=DB_MIGRATOR_PASSWORD"
+
+# what Helm stores: release values and rendered objects never contain a Secret value
+bundle_check dev "$good_dev"; bn_overrides dev '{}' >/dev/null
+bn_render dev --set migration.render=true --set-string migration.runId=t1 >"$WORK/bn-rendered.yaml"
+if ! grep -qF -e "$pw_app" -e "$pw_mig" -e 'QUJDRA' -e 'BEGIN KEY' "$WORK/overrides.json" "$WORK/bn-rendered.yaml" \
+   && [ "$(yq -N 'select(.kind == "Secret") | .metadata.name' "$WORK/bn-rendered.yaml")" = "" ] \
+   && ! yq -N -o=json 'select(.kind == "ConfigMap") | .data | keys' "$WORK/bn-rendered.yaml" | grep -qiE 'PASSWORD|APP_KEY|CERTIFICATE'; then
+  pass "no Secret value in what Helm stores: the values passed to helm, the ConfigMap and every rendered object"
+else
+  fail "a Secret value reached the Helm input or a rendered object"
+fi
+bn_objects="$(yq ea -o=json '[.]' "$WORK/bn-rendered.yaml")"
+if [ "$(jq -c '.[] | select(.kind == "Job") | .spec.template.spec.containers[0] | [(.env[] | select(.name == "DB_USERNAME") | .value), ([.envFrom[].secretRef.name] | join(","))]' <<<"$bn_objects")" = '["example_migrator","example-api-app,example-api-migrate"]' ] \
+   && [ "$(yq -N 'select(.kind == "ConfigMap") | .data.DB_USERNAME' "$WORK/bn-rendered.yaml")" = "example_dev_app" ]; then
+  pass "migrations run as the migration role with the migrate Secret last (its DB_PASSWORD wins); the application keeps its own role"
+else
+  fail "migration role / Secret order"
+fi
+if [ "$(jq -c '.[] | select(.kind == "Deployment") | .spec.template.spec.containers[0] | [((.env // []) | length), ([.envFrom[] | keys[0]] | join(","))]' <<<"$bn_objects")" = '[0,"configMapRef,secretRef"]' ] \
+   && [ "$(jq -c '.[] | select(.kind == "Job") | .spec.template.spec.containers[0].env | map(.name) | (length == (unique | length))' <<<"$bn_objects")" = "true" ]; then
+  pass "no variable is declared twice: configuration comes from the ConfigMap, Secret keys from the Secret, nothing in env"
+else
+  fail "duplicate environment declarations"
+fi
+
+# operator tool = the same step
+if ( cd "$bn_src" && TMPDIR="$WORK" ../../scripts/env-bundle.sh template stage ) >"$WORK/tpl.json" 2>"$WORK/tpl.log" \
+   && [ "$(jq -c '[keys[] | select(startswith("STAGE_") | not)] | length' "$WORK/tpl.json")" = "0" ] \
+   && [ "$(jq -c '[.[] | select(. != "")] | length' "$WORK/tpl.json")" = "0" ] \
+   && [ "$(jq -r 'keys_unsorted[0:3] | join(",")' "$WORK/tpl.json")" = "STAGE_APP_KEY,STAGE_DB_PASSWORD,STAGE_DB_MIGRATOR_PASSWORD" ] \
+   && jq -e 'has("STAGE_PARTNER_API_TOKEN") and has("STAGE_FEATURE_WRITES_ENABLED") and has("STAGE_DB_HOST")' "$WORK/tpl.json" >/dev/null; then
+  pass "scripts/env-bundle.sh template: every key of the environment, required first, all values empty"
+else
+  fail "env-bundle.sh template"; cat "$WORK/tpl.log" "$WORK/tpl.json"
+fi
+if ( cd "$bn_src" && TMPDIR="$WORK" ../../scripts/env-bundle.sh template dev ) | jq -e 'has("DEV_FEATURE_WRITES_ENABLED") or has("DEV_PARTNER_API_TOKEN") | not' >/dev/null; then
+  pass "  ... locked names and Secrets of other environments are left out of the dev template"
+else
+  fail "dev template contains locked or undeclared names"
+fi
+printf '%s' "$good_dev" >"$WORK/operator-bundle.json"
+if ( cd "$bn_src" && TMPDIR="$WORK" ../../scripts/env-bundle.sh check dev "$WORK/operator-bundle.json" ) >"$WORK/op.log" 2>&1 \
+   && grep -qF 'Secret keys from the bundle' "$WORK/op.log" && ! grep -qF -e "$pw_app" -e "$pw_mig" "$WORK/op.log"; then
+  pass "scripts/env-bundle.sh check: accepts a valid bundle and prints names only"
+else
+  fail "env-bundle.sh check (valid)"; cat "$WORK/op.log"
+fi
+( cd "$bn_src" && TMPDIR="$WORK" ../../scripts/env-bundle.sh template dev ) >"$WORK/operator-empty.json"
+if ( cd "$bn_src" && TMPDIR="$WORK" ../../scripts/env-bundle.sh check dev "$WORK/operator-empty.json" ) >"$WORK/op.log" 2>&1; then
+  fail "env-bundle.sh check accepted an unfilled template"
+elif [ "$(grep -c '^ERROR: env-bundle: .* is required' "$WORK/op.log")" = "3" ]; then
+  pass "scripts/env-bundle.sh check: an unfilled template is refused with the list of missing names"
+else
+  fail "env-bundle.sh check (missing)"; cat "$WORK/op.log"
+fi
+
+echo "== consumers: every application repository against the candidate workflows"
+cc=(python3 tests/check_consumers.py)
+if "${cc[@]}" >"$WORK/consumers.log" 2>&1; then
+  pass "committed consumer snapshots (tests/consumers/*.json) satisfy the candidate interfaces"
+else
+  fail "a consumer snapshot is not compatible with the candidate"; cat "$WORK/consumers.log"
+fi
+if [ "$(yq -r '.consumers | length' tests/consumers.yaml)" = "$(find tests/consumers -name '*.json' | wc -l | tr -d ' ')" ]; then
+  pass "every consumer of tests/consumers.yaml has a snapshot"
+else
+  fail "consumers without a snapshot (or snapshots without a consumer)"
+fi
+# The real callers: a workspace with sibling checkouts (local), or fetched with a read-only token (CI).
+ws="${AKJET_WORKSPACE:-}"
+if [ -z "$ws" ] && [ -n "${CONSUMERS_READ_TOKEN:-}" ]; then
+  if tests/fetch-consumers.sh "$WORK/consumers-src" >"$WORK/fetch.log" 2>&1; then ws="$WORK/consumers-src"; else fail "fetching the consumers"; cat "$WORK/fetch.log"; fi
+fi
+if [ -z "$ws" ]; then
+  ws=..; for n in $(yq -r '.consumers[].name' tests/consumers.yaml); do [ -d "../$n/.github/workflows" ] || ws=""; done
+fi
+if [ -n "$ws" ]; then
+  if "${cc[@]}" --workspace "$ws" --fail-on-stale-snapshot --against-pinned --report "$WORK/consumers-report.txt" >"$WORK/consumers.log" 2>&1; then
+    pass "real callers of all consumers ($ws): interfaces, permissions, namespaces, Helm values, Docker build contract, opt-in behaviour; snapshots are current"
+  else
+    fail "a real consumer is not compatible with the candidate (or a snapshot is stale)"
+  fi
+  sed 's/^/      /' "$WORK/consumers.log"
+else
+  echo "      real callers not available (no workspace, no CONSUMERS_READ_TOKEN): only the snapshots were validated"
+fi
+
+# The checker itself: a synthetic consumer built from the caller templates, then one defect at a time.
+syn="$WORK/syn"; rm -rf "$syn"; mkdir -p "$syn/ws/example-api/.github/workflows" "$syn/snap"
+pin="1234567890abcdef1234567890abcdef12345678"
+for t in "${templates[@]}"; do
+  sed -e 's#example-org/ci/#Akjet-dev/ci/#' -e "s#<CI_COMMIT>#$pin#" "$t" >"$syn/ws/example-api/.github/workflows/$(basename "$t")"
+done
+cp -R tests/secrets/deploy "$syn/ws/example-api/deploy"; printf 'FROM scratch\n' >"$syn/ws/example-api/Dockerfile"
+printf 'consumers:\n  - { name: example-api, repository: Example-Org/example-api, ref: dev-k8s/release, namespace: { dev: dev-example-api, stage: stage-example-api } }\n' >"$syn/manifest.yaml"
+syn_check() { "${cc[@]}" --manifest "$syn/manifest.yaml" --snapshots "$syn/snap" --workspace "$syn/ws" "$@" >"$WORK/syn.log" 2>&1; }
+if syn_check --write-snapshots --strict-sha && syn_check --fail-on-stale-snapshot; then
+  pass "the caller templates of examples/service-repo satisfy the candidate interfaces"
+else
+  fail "caller templates against the candidate"; cat "$WORK/syn.log"
+fi
+# shellcheck disable=SC2016  # literal GitHub expressions inside a yq program
+yq -i '.jobs.deploy-dev.secrets = {"app-secrets": "app.DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}\nmigrate.DB_PASSWORD?=${{ secrets.DEV_DB_MIGRATOR_PASSWORD }}\n"}' "$syn/ws/example-api/.github/workflows/k8s-deploy.yml"
+if syn_check; then pass "explicit app-secrets on the deploying call are accepted (services that do not use a bundle)"; else fail "app-secrets caller"; cat "$WORK/syn.log"; fi
+# shellcheck disable=SC2016
+yq -i '.jobs.deploy-dev.secrets = {"env-bundle": "${{ secrets.DEV_API_ENV }}"}' "$syn/ws/example-api/.github/workflows/k8s-deploy.yml"
+if syn_check; then pass "an env-bundle on the deploying call is accepted (services with many variables)"; else fail "env-bundle caller"; cat "$WORK/syn.log"; fi
+yq -i 'del(.jobs.deploy-dev.secrets)' "$syn/ws/example-api/.github/workflows/k8s-deploy.yml"
+if syn_check; then pass "a caller without any runtime secret is accepted (static frontends)"; else fail "caller without secrets"; cat "$WORK/syn.log"; fi
+sed -i.bak "s#$pin#abcdefabcdefabcdefabcdefabcdefabcdefabcd#" "$syn/ws/example-api/.github/workflows/k8s-deploy.yml"
+if syn_check --fail-on-stale-snapshot; then pass "moving a consumer to another revision does not make its snapshot stale"; else fail "snapshot staleness on a revision change"; cat "$WORK/syn.log"; fi
+mv "$syn/ws/example-api/.github/workflows/k8s-deploy.yml.bak" "$syn/ws/example-api/.github/workflows/k8s-deploy.yml"
+syn_defect() {  # label, expected text, file, yq edit
+  local label="$1" text="$2" file="$syn/ws/example-api/.github/workflows/$3"
+  cp "$file" "$WORK/syn-backup.yml"; yq -i "$4" "$file"
+  if syn_check; then fail "not detected: $label"
+  elif grep -qF -- "$text" "$WORK/syn.log"; then pass "detected: $label"
+  else fail "detected for another reason: $label"; grep ERROR "$WORK/syn.log"; fi
+  cp "$WORK/syn-backup.yml" "$file"
+}
+syn_defect "a secret the referenced workflow does not define (the 'Invalid secret' start-up failure)" \
+  "Invalid secret, legacy-secrets is not defined in the referenced workflow" k8s-deploy.yml '.jobs.deploy-dev.secrets."legacy-secrets" = "x"'
+syn_defect "an input the referenced workflow does not define" "input 'namespace' is not defined" k8s-deploy.yml '.jobs.deploy-dev.with.namespace = "other"'
+syn_defect "a missing required input" "required input 'chart-version' is missing" k8s-deploy.yml 'del(.jobs.deploy-dev.with."chart-version")'
+syn_defect "a string where a boolean is declared" "input 'validate-only' must be boolean" k8s-build.yml '.jobs.validate.with."validate-only" = "true"'
+syn_defect "secrets: inherit" "secrets: inherit" k8s-deploy.yml '.jobs.deploy-dev.secrets = "inherit"'
+# shellcheck disable=SC2016  # literal GitHub expression inside a yq program
+syn_defect "an output the referenced workflow does not provide" "output 'tag' is not defined" k8s-build.yml '.jobs.deploy-dev.with.digest = "${{ needs.image.outputs.tag }}"'
+syn_defect "a caller job without packages: read (private chart)" "the referenced workflow needs packages: read" k8s-deploy.yml '.jobs.deploy-dev.permissions = {"contents": "read"}'
+syn_defect "a build call without packages: write" "the referenced workflow needs packages: write" k8s-build.yml '.jobs.image.permissions.packages = "read"'
+syn_defect "a mutable reference instead of a commit SHA" "is not a full commit SHA" k8s-deploy.yml '.jobs.deploy-dev.uses = "Akjet-dev/ci/.github/workflows/deploy-k8s.yml@main"'
+syn_defect "a reusable workflow that does not exist" "has no reusable workflow sync-secrets.yml" k8s-deploy.yml '.jobs.deploy-dev.uses = "Akjet-dev/ci/.github/workflows/sync-secrets.yml@'"$pin"'"'
+# shellcheck disable=SC2016  # literal GitHub expression inside a yq program
+syn_defect "runtime secrets on a validate-only call" "app-secrets passed to a validate-only call" k8s-build.yml '.jobs.validate.secrets."app-secrets" = "app.DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}"'
+# shellcheck disable=SC2016  # literal GitHub expression inside a yq program
+syn_defect "app-secrets together with env-bundle" "app-secrets and env-bundle are passed together" k8s-deploy.yml '.jobs.deploy-dev.secrets = {"app-secrets": "app.DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}", "env-bundle": "${{ secrets.DEV_API_ENV }}"}'
+# shellcheck disable=SC2016  # literal GitHub expression inside a yq program
+syn_defect "a secret of another environment in the dev deployment" "reads secrets of another environment: STAGE_API_ENV" k8s-deploy.yml '.jobs.deploy-dev.secrets = {"env-bundle": "${{ secrets.STAGE_API_ENV }}"}'
+syn_defect "another chart version than the candidate ships" "chart-version 9.9.9 != charts/akjet-app" k8s-deploy.yml '.jobs.deploy-dev.with."chart-version" = "9.9.9"'
+syn_defect "a call of a local workflow that is not reusable" "K7" k8s-build.yml '.jobs.extra = {"uses": "./.github/workflows/k8s-deploy.yml", "with": {"digest": "x"}, "permissions": {"contents": "read"}}'
+# shellcheck disable=SC2016  # literal GitHub expression inside a yq program
+syn_defect "a BuildKit secret passed that the Dockerfile never mounts" "passes secrets ['COMPOSER_AUTH'] that the Dockerfile never mounts" k8s-build.yml '.jobs.image.secrets."build-secrets" = "COMPOSER_AUTH=${{ secrets.X }}"'
+yq -i '.consumers[0].namespace.dev = "dev-other"' "$syn/manifest.yaml"
+if syn_check; then fail "not detected: namespace drift between the workflow and the platform"
+elif grep -qF "resolves dev to namespace dev-example-api, the platform expects dev-other" "$WORK/syn.log"; then pass "detected: the namespace the candidate resolves differs from what the platform provides"
+else fail "namespace drift detected for another reason"; fi
+yq -i '.consumers[0].namespace.dev = "dev-example-api"' "$syn/manifest.yaml"
+sed -i.bak "s#$pin#0000000000000000000000000000000000000000#" "$syn/ws/example-api/.github/workflows/k8s-deploy.yml"
+if syn_check && grep -q 'PENDING' "$WORK/syn.log" && ! syn_check --strict-sha && grep -q 'K10 consumers pin different revisions\|all-zero placeholder' "$WORK/syn.log"; then
+  pass "the zero placeholder and mixed revisions are reported, and refused in strict mode"
+else
+  fail "placeholder / mixed revisions"; cat "$WORK/syn.log"
+fi
+mv "$syn/ws/example-api/.github/workflows/k8s-deploy.yml.bak" "$syn/ws/example-api/.github/workflows/k8s-deploy.yml"
+
+# scripts/update-ci-sha.sh on a throw-away clone: the candidate becomes a commit on origin/main THERE only.
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  up="$WORK/up"; rm -rf "$up"; mkdir -p "$up"
+  git clone --quiet --no-hardlinks . "$up/ci" 2>/dev/null
+  ( cd "$up/ci" && git checkout --quiet --detach 2>/dev/null && git remote remove origin
+    ( cd "$OLDPWD" && COPYFILE_DISABLE=1 tar --exclude=.git -cf - . ) | tar -xf -
+    cp "$syn/manifest.yaml" tests/consumers.yaml
+    git add -A && git -c user.name=test -c user.email=test@example.test commit --quiet -m candidate
+    git update-ref refs/remotes/origin/main HEAD ) >"$WORK/up-setup.log" 2>&1
+  new_sha="$(git -C "$up/ci" rev-parse HEAD)"
+  cp -R "$syn/ws/example-api" "$up/example-api"
+  printf 'jobs:\n  legacy:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n      - uses: Akjet-dev/ci/netbird@c0f048ff11eda0ffb2817d4ef98d9183b831046d\n' >"$up/example-api/.github/workflows/deploy.yml"
+  ( cd "$up/example-api" && git init --quiet && git add -A && git -c user.name=test -c user.email=test@example.test commit --quiet -m base ) >/dev/null 2>&1
+  before="$(cat "$up/example-api/.github/workflows/"*.yml | shasum | cut -d' ' -f1)"
+  if ( cd "$up/ci" && scripts/update-ci-sha.sh "$new_sha" ) >"$WORK/up.log" 2>&1 && grep -q 'dry run: 2 file(s) would change' "$WORK/up.log" \
+     && [ "$(cat "$up/example-api/.github/workflows/"*.yml | shasum | cut -d' ' -f1)" = "$before" ]; then
+    pass "update-ci-sha.sh: the default is a dry run that shows the diff and changes nothing"
+  else
+    fail "update-ci-sha.sh dry run"; cat "$WORK/up.log" "$WORK/up-setup.log"
+  fi
+  ( cd "$up/ci" && scripts/update-ci-sha.sh "$new_sha" --apply ) >"$WORK/up.log" 2>&1 && up_rc=0 || up_rc=$?
+  up_refs="$(grep -h 'uses: Akjet-dev/ci/.github/workflows/' "$up/example-api/.github/workflows/"k8s-*.yml | grep -c "@$new_sha" || true)"
+  up_old="$(grep -h '^ *uses:' "$up/example-api/.github/workflows/"k8s-*.yml | grep -c "$pin" || true)"
+  up_other="$(git -C "$up/example-api" status --porcelain | grep -vc 'k8s-' || true)"
+  up_lines="$(git -C "$up/example-api" diff --numstat | awk '{a+=$1; d+=$2} END {print a "/" d}')"
+  up_commits="$(git -C "$up/example-api" rev-list --count HEAD)"
+  if [ "$up_rc/$up_refs/$up_old/$up_other/$up_lines/$up_commits" = "0/4/0/0/4/4/1" ]; then
+    pass "update-ci-sha.sh --apply: exactly the four shared-workflow references change; other actions and files are untouched; nothing is committed"
+  else
+    fail "update-ci-sha.sh --apply (rc/refs/old/other files/lines/commits = $up_rc/$up_refs/$up_old/$up_other/$up_lines/$up_commits)"; tail -5 "$WORK/up.log"
+  fi
+  up_reject() {  # label, expected text, argument
+    if ( cd "$up/ci" && scripts/update-ci-sha.sh "$3" --apply ) >"$WORK/up.log" 2>&1; then fail "update-ci-sha.sh accepted: $1"
+    elif grep -qF -- "$2" "$WORK/up.log"; then pass "update-ci-sha.sh refuses $1"; else fail "update-ci-sha.sh refused for another reason: $1"; cat "$WORK/up.log"; fi
+  }
+  up_reject "a branch name" "full 40-character commit SHA" main
+  up_reject "a short SHA" "full 40-character commit SHA" "${new_sha:0:12}"
+  up_reject "the zero placeholder" "zero placeholder" 0000000000000000000000000000000000000000
+  up_reject "a revision that does not exist" "is not a commit of this repository" 1111111111111111111111111111111111111111
+  unmerged="$( cd "$up/ci" && git -c user.name=test -c user.email=test@example.test commit --quiet --allow-empty -m unmerged && git rev-parse HEAD )"
+  up_reject "a commit that is not on origin/main" "is not part of origin/main" "$unmerged"
+  ( cd "$up/example-api" && git checkout --quiet -- . && yq -i '.jobs.deploy-dev.secrets."legacy-secrets" = "x"' .github/workflows/k8s-deploy.yml )
+  up_reject "an update while a consumer is incompatible with that revision" "not compatible with $new_sha" "$new_sha"
+  if [ -z "$(git -C "$up/example-api" diff --stat -- .github/workflows/k8s-build.yml)" ]; then pass "  ... and leaves every file as it was"; else fail "files changed although the update was refused"; fi
+fi
 
 echo "== branch model: Kubernetes workflows next to the existing deployment"
 bm="$WORK/branch-model"; mkdir -p "$bm/ok"

@@ -1,0 +1,7 @@
+config:
+  APP_ENV: stage
+  DB_USERNAME: example_stage_app
+# stage talks to a partner: one more Secret, all of its keys optional (overrides.yaml)
+requiredSecrets:
+  integrations: [PARTNER_API_TOKEN, PARTNER_LOGIN]
+envFromSecrets: [app, integrations]

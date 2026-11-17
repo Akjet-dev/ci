@@ -1,0 +1,28 @@
+# Consumers of the reusable workflows of this repository (tests/check_consumers.py).
+#   name        directory of the checkout in a workspace and the Helm release name
+#   repository  owner/name on GitHub: the namespace is derived from it by deploy-k8s.yml
+#   ref         branch whose callers are validated (the branch that deploys to DEV)
+#   namespace   what the platform (k8s-infra namespaces/*.yaml) provides - the candidate must resolve to it
+# A new service: add an entry here, run  tests/check_consumers.py --workspace .. --write-snapshots  and commit
+# tests/consumers/<name>.json together with it.
+consumers:
+  - name: backend
+    repository: Akjet-dev/backend
+    ref: dev-k8s/release
+    namespace: { dev: dev-lk-backend, stage: stage-lk-backend }
+  - name: lk-frontend
+    repository: Akjet-dev/lk-frontend
+    ref: dev-k8s/release
+    namespace: { dev: dev-lk-backend, stage: stage-lk-backend }
+  - name: executor-frontend
+    repository: Akjet-dev/executor-frontend
+    ref: dev-k8s/release
+    namespace: { dev: dev-executor-frontend, stage: stage-executor-frontend }
+  - name: landing
+    repository: Akjet-dev/landing
+    ref: dev-k8s/release
+    namespace: { dev: dev-landing, stage: stage-landing }
+  - name: bcc-kommo-api
+    repository: Akjet-dev/bcc-kommo-api
+    ref: dev-k8s/release
+    namespace: { dev: dev-bcc-kommo-api, stage: stage-bcc-kommo-api }

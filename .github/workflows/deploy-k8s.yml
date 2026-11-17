@@ -14,10 +14,14 @@ name: Deploy to Kubernetes
 #   stage  validation only (validate-only: true); this workflow never deploys it
 #
 # The workflow receives no kubeconfig: the in-cluster runner uses its own ServiceAccount
-# (arc-runners/app-deployer). The only secret it accepts is the optional `app-secrets`: values the caller
-# maps explicitly from its repository secrets to keys of Kubernetes Secrets the release declares
-# (requiredSecrets). They are used by the deploy job only, written with server-side apply, never printed and
-# never stored in a ConfigMap, a Helm release, an output, an artifact or a summary.
+# (arc-runners/app-deployer). It accepts two optional secrets, never both in one run:
+#   env-bundle   ONE JSON object with the configuration of ONE environment, keys <ENV>_<NAME>. What a key
+#                means is decided by the values files of the service, not by the caller: a NAME declared in
+#                requiredSecrets becomes a key of that Kubernetes Secret; a NAME listed in
+#                <values-dir>/overrides.yaml overrides config.<NAME>; anything else is refused.
+#   app-secrets  explicit lines <secret>.<KEY>=<value> for callers with a handful of values.
+# Secret values are written with server-side apply, never printed and never stored in a ConfigMap, a Helm
+# release, an output, an artifact or a summary.
 # akjet-ds-apps is ONE runner scale set shared by all application
 # repositories; on GitHub Free it sits in the organization Default runner group, so GitHub does not
 # restrict which repository reaches it. The enforced boundary is the cluster RBAC: the ServiceAccount
@@ -83,6 +87,17 @@ on:
           before anything is changed. Only the deploying job (dev) may receive it. The Secret objects are
           created by the platform; the runner may only patch the ones it was granted.
         required: false
+      env-bundle:
+        description: >-
+          Optional configuration of the target environment as one JSON object: {"<ENV>_<NAME>": "<value>"}
+          with string values only (any content, multi-line included). <ENV> is the upper-case environment
+          (DEV_ for dev); a key of another environment is refused. NAME declared in requiredSecrets ->
+          key of that Secret (a different bundle name: secrets.aliases in <values-dir>/overrides.yaml);
+          NAME listed under overrides in that file -> config.<NAME>, checked like a repository variable and
+          applied after it; any other NAME is an error. Every declared Secret key must be present unless
+          it is listed in secrets.optional. An empty string counts as absent. Only the deploying job (dev)
+          may receive it; do not pass app-secrets together with it.
+        required: false
 
 permissions:
   contents: read
@@ -117,6 +132,7 @@ jobs:
       deploy: ${{ steps.target.outputs.deploy }}
       overrides: ${{ steps.overrides.outputs.json }}
       declared-secrets: ${{ steps.declared.outputs.list }}
+      secret-plan: ${{ steps.bundle.outputs.plan }}
     steps:
       - name: Resolve and check the target
         id: target
@@ -132,6 +148,7 @@ jobs:
           DEPLOY_ENABLED: ${{ vars.K8S_DEV_DEPLOY_ENABLED }}
           # Only whether the secret was passed, never its content: this job runs outside the cluster.
           APP_SECRETS_SUPPLIED: ${{ secrets.app-secrets != '' }}
+          ENV_BUNDLE_SUPPLIED: ${{ secrets.env-bundle != '' }}
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
@@ -184,6 +201,12 @@ jobs:
           if [ "${APP_SECRETS_SUPPLIED:-false}" = "true" ] && [ "${deploy}" != "true" ]; then
             die "app-secrets may be passed only to the job that deploys to dev; validation never receives secret values"
           fi
+          if [ "${ENV_BUNDLE_SUPPLIED:-false}" = "true" ] && [ "${deploy}" != "true" ]; then
+            die "env-bundle may be passed only to the run that deploys to dev; a validation-only run never receives secret values"
+          fi
+          if [ "${ENV_BUNDLE_SUPPLIED:-false}" = "true" ] && [ "${APP_SECRETS_SUPPLIED:-false}" = "true" ]; then
+            die "pass either env-bundle or app-secrets, not both"
+          fi
 
           if [ "${VALIDATE_ONLY}" = "true" ] && [ -z "${DIGEST}" ]; then
             # Validation does not need a real image: a placeholder digest keeps the schema satisfied.
@@ -224,6 +247,128 @@ jobs:
         with:
           persist-credentials: false
 
+      # One JSON object with the configuration of the target environment (secret env-bundle). This step only
+      # classifies and checks it: nothing is written anywhere, and no value is printed - messages carry names.
+      #   NAME declared in requiredSecrets        -> key of that Kubernetes Secret (written by the deploy job)
+      #   NAME listed in overrides.yaml overrides -> config.<NAME> (validated by the next step, like a variable)
+      #   anything else                           -> error
+      # Rules of <values-dir>/overrides.yaml used here:
+      #   secrets.aliases   { BUNDLE_NAME: <secret>.<KEY> }  only where the bundle name differs from the key
+      #   secrets.optional  [ <secret>.<KEY> | <secret>.* ]  may be absent; every other declared key is required
+      #   locked.<environment>  [ NAME ]                     may not be supplied for that environment at all
+      # BUNDLE_MODE=template prints a bundle skeleton instead (scripts/env-bundle.sh); it is never set in CI.
+      - name: Check the environment bundle
+        id: bundle
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          VALUES_DIR: ${{ inputs.values-dir }}
+          ENV_BUNDLE: ${{ secrets.env-bundle }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$1"; exit 1; }
+          mode="${BUNDLE_MODE:-check}"
+          prefix="$(printf '%s' "${ENVIRONMENT}" | tr '[:lower:]' '[:upper:]')_"
+          config_out="${RUNNER_TEMP}/bundle-config.json"
+          echo '{}' > "${config_out}"
+          if [ "${mode}" = "check" ] && [ -z "${ENV_BUNDLE:-}" ]; then
+            echo "plan=" >> "${GITHUB_OUTPUT}"
+            echo "No env-bundle was passed."
+            exit 0
+          fi
+          for f in "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"; do
+            test -f "${f}" || die "values file not found: ${f}"
+          done
+          # Declarations of the service (names only), with the precedence of Helm.
+          # shellcheck disable=SC2016  # yq / jq programs, not shell
+          yq ea -o=json '. as $doc ireduce ({}; . * $doc) | {"config": ((.config // {}) | keys), "secrets": (.requiredSecrets // {})}' \
+            "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml" > "${RUNNER_TEMP}/bundle-declared.json"
+          if [ -f "${VALUES_DIR}/overrides.yaml" ]; then
+            yq -o=json '.' "${VALUES_DIR}/overrides.yaml" > "${RUNNER_TEMP}/bundle-rules.json"
+          else
+            echo '{}' > "${RUNNER_TEMP}/bundle-rules.json"
+          fi
+          if [ "${mode}" = "check" ]; then
+            # jq quotes its input in parse errors: its diagnostics are discarded, never shown.
+            printf '%s' "${ENV_BUNDLE}" | jq -e 'type == "object"' >/dev/null 2>&1 \
+              || die "env-bundle is not a JSON object (its content is not shown)"
+            bytes="$(printf '%s' "${ENV_BUNDLE}" | wc -c | tr -d ' ')"
+          else
+            ENV_BUNDLE='{}'; bytes=0
+          fi
+          # shellcheck disable=SC2016  # jq program, not shell
+          result="$(printf '%s' "${ENV_BUNDLE}" | jq -c --arg prefix "${prefix}" --arg env "${ENVIRONMENT}" \
+                      --slurpfile decl "${RUNNER_TEMP}/bundle-declared.json" --slurpfile rules "${RUNNER_TEMP}/bundle-rules.json" '
+            . as $b
+            | $decl[0] as $d
+            | (($rules[0] // {}) | if type == "object" then . else {} end) as $r
+            | ($r.overrides // {}) as $allow
+            | (($r.secrets // {}).aliases // {}) as $aliases
+            | (($r.secrets // {}).optional // []) as $optional
+            | (($r.locked // {})[$env] // []) as $locked
+            | [$d.secrets | to_entries[] | .key as $s | (.value // [])[] | "\($s).\(.)"] as $targets
+            | ($aliases | to_entries | map({key: .value, value: .key}) | from_entries) as $aliasOf
+            # target "<secret>.<KEY>" -> its name in the bundle (the key itself unless an alias renames it)
+            | ($targets | map({key: ., value: ($aliasOf[.] // (split(".")[1:] | join(".")))}) | from_entries) as $source
+            | ($source | to_entries | map({key: .value, value: .key}) | from_entries) as $targetOf
+            | ($source | to_entries | group_by(.value) | map(select(length > 1)
+                | "\(.[0].value) is the bundle name of more than one Secret key (\(map(.key) | join(", "))): give the others their own name in secrets.aliases of overrides.yaml")) as $ambiguous
+            | ($aliases | to_entries | map(select((.key | test("^[A-Z][A-Z0-9_]*$") | not) or (.value | test("^[a-z0-9]([a-z0-9-]*[a-z0-9])?\\.[A-Za-z0-9_.-]+$") | not))
+                | "secrets.aliases: an entry is not NAME: <secret>.<KEY>")) as $badAliases
+            | def optional($t): ($optional | index($t)) != null or ($optional | index(($t | split(".")[0]) + ".*")) != null;
+            def provided($t): ($b[$prefix + $source[$t]] | type == "string" and length > 0);
+            if $mode == "template" then
+              { template:
+                  ( ($targets | map(select(optional(.) | not)) | map({key: ($prefix + $source[.]), value: ""}))
+                  + ($targets | map(select(optional(.))) | map({key: ($prefix + $source[.]), value: ""}))
+                  + ($allow | keys | map(select(. as $n | $locked | index($n) | not)) | map({key: ($prefix + .), value: ""}))
+                  | from_entries ),
+                required: ($targets | map(select(optional(.) | not)) | map($prefix + $source[.])),
+                errors: ($ambiguous + $badAliases) }
+            else
+              ( [ $b | to_entries[]
+                  | .key as $k | .value as $v
+                  | if ($k | startswith($prefix) | not) then
+                      (if ($k | test("^[A-Z][A-Z0-9]*_[A-Z][A-Z0-9_]*$")) then "\($k) does not start with \($prefix): a bundle holds the keys of exactly one environment and this run accepts no other"
+                       else "a key does not start with \($prefix) (the key is not shown)" end)
+                    else ($k | ltrimstr($prefix)) as $n
+                    | if ($n | test("^[A-Z][A-Z0-9_]*$") | not) then "a \($prefix)* key has an invalid name: upper case letters, digits and _ only (the key is not shown)"
+                      elif ($v | type) != "string" then "\($k): the value must be a JSON string, not \($v | type)"
+                      elif ($v | length) == 0 then empty
+                      elif ($locked | index($n)) != null then "\($k): \($n) is locked for \($env) and cannot be supplied"
+                      elif $targetOf[$n] != null then empty
+                      elif $allow[$n] != null then empty
+                      elif ($d.config | index($n)) != null then "\($k): \($n) is set in the values files and is not listed under overrides in overrides.yaml"
+                      else "\($k): \($n) is declared neither in requiredSecrets of the values files nor in overrides.yaml" end
+                    end ] ) as $keyErrors
+              | ($targets | map(select(provided(.)))) as $have
+              | ($targets | map(select((provided(.) | not) and (optional(.) | not))
+                  | "\($prefix)\($source[.]) is required (key of Secret \(.)) and is missing or empty")) as $missing
+              | { errors: ($ambiguous + $badAliases + $keyErrors + $missing),
+                  plan: ($have | map("\(.)=\($source[.])")),
+                  config: ([ $b | to_entries[] | select(.key | startswith($prefix)) | (.key | ltrimstr($prefix)) as $n
+                             | select((.value | type) == "string" and (.value | length) > 0 and $targetOf[$n] == null and $allow[$n] != null) ] | from_entries) }
+            end
+          ' --arg mode "${mode}" 2>/dev/null)" || die "env-bundle could not be evaluated (its content is not shown)"
+          unset ENV_BUNDLE
+          errors="$(printf '%s' "${result}" | jq -r '.errors[]')"
+          if [ -n "${errors}" ]; then
+            while IFS= read -r line; do echo "::error::env-bundle: ${line}"; done <<< "${errors}"
+            exit 1
+          fi
+          if [ "${mode}" = "template" ]; then
+            printf '%s' "${result}" | jq '.template'
+            exit 0
+          fi
+          printf '%s' "${result}" | jq -c '.config' > "${config_out}"
+          plan="$(printf '%s' "${result}" | jq -r '.plan | join(" ")')"
+          echo "plan=${plan}" >> "${GITHUB_OUTPUT}"
+          echo "env-bundle: ${bytes} bytes (GitHub limit for one secret: 48 KB)"
+          echo "Secret keys from the bundle: $(printf '%s' "${result}" | jq -r '[.plan[] | split("=")[0]] | join(", ") | if . == "" then "none" else . end')"
+          echo "Configuration overrides from the bundle: $(printf '%s' "${result}" | jq -r '.config | keys | map(ltrimstr($p)) | join(", ") | if . == "" then "none" else . end' --arg p "${prefix}")"
+          if [ "${bytes}" -gt 44000 ]; then
+            echo "::warning::env-bundle is ${bytes} bytes; GitHub rejects a secret larger than 48 KB - split the configuration before it grows further"
+          fi
+
       # Optional overrides of NON-SENSITIVE configuration by GitHub repository variables of the calling
       # repository. The values files stay the source of configuration; a variable only replaces a value the
       # service explicitly allowed in <values-dir>/overrides.yaml:
@@ -235,6 +380,8 @@ jobs:
       # release, namespace, runner, security settings, replicas or Secret references; names that look like
       # credentials are refused; an absent or empty variable changes nothing; a variable of one environment
       # never applies to the other. Variables are read as data (JSON), never interpolated into a command.
+      # The same rules apply to the configuration part of env-bundle (previous step): it is merged over the
+      # repository variables and validated here. locked.<environment> names are refused from either source.
       - name: Resolve variable overrides
         id: overrides
         env:
@@ -254,17 +401,20 @@ jobs:
           prefix="$(printf '%s' "${ENVIRONMENT}" | tr '[:lower:]' '[:upper:]')_"
           vars_file="${RUNNER_TEMP}/repository-variables.json"
           printf '%s' "${REPOSITORY_VARIABLES:-null}" > "${vars_file}"
+          bundle_file="${RUNNER_TEMP}/bundle-config.json"
+          [ -f "${bundle_file}" ] || echo '{}' > "${bundle_file}"
           yq -o=json '.' "${allow}" > "${RUNNER_TEMP}/overrides-allow.json"
           # shellcheck disable=SC2016  # jq program, not shell
-          jq -n --arg prefix "${prefix}" --slurpfile allow "${RUNNER_TEMP}/overrides-allow.json" \
-                --slurpfile vars "${vars_file}" '
+          jq -n --arg prefix "${prefix}" --arg env "${ENVIRONMENT}" --slurpfile allow "${RUNNER_TEMP}/overrides-allow.json" \
+                --slurpfile vars "${vars_file}" --slurpfile bundle "${bundle_file}" '
             def fail($m): error($m);
             ($allow[0] // {}) as $doc
-            | (if ($doc | type) != "object" or (($doc | keys) - ["overrides"] | length) > 0
-               then fail("overrides.yaml: only the top-level key \"overrides\" is allowed") else . end)
+            | (if ($doc | type) != "object" or (($doc | keys) - ["overrides", "secrets", "locked"] | length) > 0
+               then fail("overrides.yaml: only the top-level keys \"overrides\", \"secrets\" and \"locked\" are allowed") else . end)
+            | ((($doc.locked // {}) | if type == "object" then . else fail("overrides.yaml: \"locked\" must be a map of environment -> list of names") end)[$env] // []) as $locked
             | ($doc.overrides // {}) as $list
             | (if ($list | type) != "object" then fail("overrides.yaml: \"overrides\" must be a map") else . end)
-            | (($vars[0] // {}) | if type == "object" then . else {} end) as $v
+            | ((($vars[0] // {}) | if type == "object" then . else {} end) + (($bundle[0] // {}) | if type == "object" then . else {} end)) as $v
             # every entry of the allow-list is checked, whether or not its variable is set
             | reduce ($list | to_entries[]) as $e ({};
                 ($e.key) as $name
@@ -280,6 +430,7 @@ jobs:
                 | (if (["string", "host", "url", "integer", "boolean"] | index($type)) then . else fail("overrides.\($name): unknown type \($type)") end)
                 | ($v[$prefix + $name]) as $raw
                 | if $raw == null or ($raw | tostring) == "" then .
+                  elif ($locked | index($name)) != null then fail("variable \($prefix)\($name): \($name) is locked for \($env) (overrides.yaml) and cannot be supplied")
                   else ($raw | tostring) as $value
                   | (if ($value | length) > 2048 or ($value | test("[[:cntrl:]]")) then fail("variable \($prefix)\($name): control characters or more than 2048 characters") else . end)
                   | (if $type == "host" and ($value | test("^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$") | not) then fail("variable \($prefix)\($name): not a host name or address") else . end)
@@ -296,15 +447,15 @@ jobs:
               then fail("repository variable(s) \($unknown | map($prefix + .) | join(", ")) are not listed in overrides.yaml")
               else $result end
           ' > "${out}" || { echo "::error::variable overrides rejected (see the message above)"; exit 1; }
-          rm -f "${vars_file}"
+          rm -f "${vars_file}" "${bundle_file}"
           echo "json=$(jq -c '.' "${out}")" >> "${GITHUB_OUTPUT}"
           applied="$(jq -r '(.config // {}) | keys | join(", ")' "${out}")"
           if [ -n "${applied}" ]; then
-            echo "Overridden by ${prefix}* repository variables: ${applied}"
+            echo "Overridden by ${prefix}* repository variables or env-bundle keys: ${applied}"
             {
               echo "### Configuration overrides"
               echo
-              echo "Values replaced by \`${prefix}*\` repository variables: \`${applied}\`"
+              echo "Values replaced by \`${prefix}*\` repository variables or env-bundle keys: \`${applied}\`"
             } >> "${GITHUB_STEP_SUMMARY}"
           else
             echo "No ${prefix}* override is set: values files are used as they are."
@@ -540,24 +691,106 @@ jobs:
 
       # GitHub repository secrets -> keys of the Kubernetes Secrets the release declares. Runs before the
       # migration and the upgrade: a missing value or a missing permission stops the deployment with
-      # nothing changed. Values travel only through this step's environment and kubectl's stdin: they are
-      # never written to a file, a command line, an output or the summary, and each one is masked first.
-      # Server-side apply owns exactly the listed keys; keys written by the platform stay as they are.
-      # The Secret objects are created by the platform, and the runner needs `get` and `patch` on exactly
-      # these names (k8s-infra: ciManagedSecrets) - it is never allowed to create or list Secrets.
+      # nothing changed. Values travel only through this step's environment and pipes into kubectl's stdin:
+      # they are never written to a file, a command line, an output or the summary, and are masked first.
+      # Server-side apply owns exactly the keys supplied in this run; keys written by the platform stay as
+      # they are. The Secret objects are created by the platform, and the runner needs `get` and `patch` on
+      # exactly these names (k8s-infra: ciManagedSecrets) - it is never allowed to create or list Secrets.
+      # Two sources, never both: env-bundle (JSON; which keys go where was decided by the validate job from
+      # the values files - only names cross between the jobs) or app-secrets (explicit lines).
       - name: Provision application Secrets
         id: secrets
         env:
           APP_SECRETS: ${{ secrets.app-secrets }}
+          ENV_BUNDLE: ${{ secrets.env-bundle }}
           DECLARED: ${{ needs.validate.outputs.declared-secrets }}
+          PLAN: ${{ needs.validate.outputs.secret-plan }}
         run: |
           set -euo pipefail
-          if [ -z "${APP_SECRETS}" ]; then
-            echo "No app-secrets were passed: Kubernetes Secrets are left as they are."
-            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          die() { echo "::error::$1"; exit 1; }
+          done_unchanged() { echo "$1"; echo "changed=false" >> "${GITHUB_OUTPUT}"; exit 0; }
+          # All permissions are checked before the first write.
+          check_access() {
+            local name verb
+            for name in "$@"; do
+              for verb in get patch; do
+                kubectl auth can-i "${verb}" "secret/${RELEASE}-${name}" --namespace "${NAMESPACE}" --quiet \
+                  || die "the runner may not ${verb} Secret ${RELEASE}-${name} in ${NAMESPACE}: the platform has to list it in ciManagedSecrets of the namespace (k8s-infra) - nothing was changed"
+              done
+            done
+          }
+          # stdin: the Secret manifest. Runs at the end of a pipeline (a subshell), so "a Secret was modified"
+          # is recorded as an empty marker file; no value is ever written to disk.
+          marker="${RUNNER_TEMP}/app-secrets-changed"; rm -f "${marker}"
+          report_changed() {
+            if [ -e "${marker}" ]; then echo "changed=true" >> "${GITHUB_OUTPUT}"; else echo "changed=false" >> "${GITHUB_OUTPUT}"; fi
+            rm -f "${marker}"
+          }
+          apply_secret() {
+            local object="$1" keys="$2" before after state
+            before="$(kubectl --namespace "${NAMESPACE}" get secret "${object}" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null)" \
+              || die "Secret ${object} does not exist in ${NAMESPACE}: the platform creates the (empty) object, this workflow only fills it"
+            kubectl --namespace "${NAMESPACE}" apply --server-side --field-manager=akjet-app-secrets --force-conflicts -f - >/dev/null \
+              || die "writing Secret ${object} failed (the response is not shown)"
+            after="$(kubectl --namespace "${NAMESPACE}" get secret "${object}" -o jsonpath='{.metadata.resourceVersion}')"
+            if [ "${before}" != "${after}" ]; then : > "${marker}"; state=updated; else state=unchanged; fi
+            echo "Secret ${object}: ${state}; keys managed from GitHub: ${keys}"
+          }
+
+          if [ -n "${ENV_BUNDLE:-}" ] && [ -n "${APP_SECRETS:-}" ]; then
+            die "pass either env-bundle or app-secrets, not both (nothing was changed)"
+          fi
+
+          if [ -n "${ENV_BUNDLE:-}" ]; then
+            command -v jq >/dev/null 2>&1 || die "jq is not available on the runner; env-bundle cannot be read (nothing was changed)"
+            [ -n "${PLAN:-}" ] || done_unchanged "env-bundle carries no Secret keys: Kubernetes Secrets are left as they are."
+            prefix="$(printf '%s' "${ENVIRONMENT}" | tr '[:lower:]' '[:upper:]')_"
+            for item in ${PLAN}; do
+              printf '%s' "${item}" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.[A-Za-z0-9_.-]+=[A-Z][A-Z0-9_]*$' \
+                || die "the Secret plan of the validate job is malformed (nothing was changed)"
+              case " ${DECLARED} " in
+                *" ${item%%=*} "*) ;;
+                *) die "env-bundle: ${item%%=*} is not declared in requiredSecrets of the values (nothing was changed)" ;;
+              esac
+            done
+            # The bundle must still hold every planned key (jq diagnostics would quote the input: discarded).
+            # shellcheck disable=SC2016  # jq program, not shell
+            printf '%s' "${ENV_BUNDLE}" | jq -e --arg p "${prefix}" --arg plan "${PLAN}" '
+              . as $b | all($plan | split(" ")[]; (split("=")[1]) as $n | ($b[$p + $n] | type == "string" and length > 0))' >/dev/null 2>&1 \
+              || die "env-bundle does not contain every key planned by the validate job (nothing was changed)"
+            # Mask every line of every value (a multi-line value is masked line by line).
+            # shellcheck disable=SC2016  # jq program, not shell
+            printf '%s' "${ENV_BUNDLE}" | jq -r --arg p "${prefix}" --arg plan "${PLAN}" '
+              . as $b | $plan | split(" ")[] | $b[$p + (split("=")[1])] | split("\n")[] | sub("\r$"; "") | select(length >= 6)' 2>/dev/null \
+              | while IFS= read -r line; do echo "::add-mask::${line}"; done
+            names=""
+            for item in ${PLAN}; do
+              name="${item%%.*}"
+              case " ${names} " in *" ${name} "*) ;; *) names="${names} ${name}" ;; esac
+            done
+            # shellcheck disable=SC2086  # a list of validated names
+            check_access ${names}
+            for name in ${names}; do
+              object="${RELEASE}-${name}"
+              keys=""
+              for item in ${PLAN}; do
+                target="${item%%=*}"
+                if [ "${target%%.*}" = "${name}" ]; then keys="${keys}${target#*.} "; fi
+              done
+              # shellcheck disable=SC2016  # jq program, not shell
+              printf '%s' "${ENV_BUNDLE}" | jq -c --arg p "${prefix}" --arg plan "${PLAN}" --arg s "${name}" --arg object "${object}" '
+                . as $b
+                | { apiVersion: "v1", kind: "Secret", metadata: { name: $object },
+                    data: ([ $plan | split(" ")[] | split("=") | select(.[0] | startswith($s + "."))
+                             | { key: (.[0] | ltrimstr($s + ".")), value: ($b[$p + .[1]] | @base64) } ] | from_entries) }' 2>/dev/null \
+                | apply_secret "${object}" "${keys}"
+            done
+            unset ENV_BUNDLE
+            report_changed
             exit 0
           fi
-          die() { echo "::error::$1"; exit 1; }
+
+          [ -n "${APP_SECRETS:-}" ] || done_unchanged "Neither env-bundle nor app-secrets was passed: Kubernetes Secrets are left as they are."
           names=""      # Secret declarations that receive at least one key
           missing=""    # required keys whose GitHub secret is empty
           while IFS= read -r line || [ -n "${line}" ]; do
@@ -589,31 +822,18 @@ jobs:
           done <<< "${APP_SECRETS}"
           unset APP_SECRETS
           [ -z "${missing}" ] || die "no value for:${missing} - the repository secret mapped to it is not set (nothing was changed)"
-          [ -n "${names}" ] || { echo "Every mapped key is optional and unset: nothing to write."; echo "changed=false" >> "${GITHUB_OUTPUT}"; exit 0; }
-
-          # All permissions are checked before the first write.
-          for name in ${names}; do
-            for verb in get patch; do
-              kubectl auth can-i "${verb}" "secret/${RELEASE}-${name}" --namespace "${NAMESPACE}" --quiet \
-                || die "the runner may not ${verb} Secret ${RELEASE}-${name} in ${NAMESPACE}: the platform has to list it in ciManagedSecrets of the namespace (k8s-infra) - nothing was changed"
-            done
-          done
-          changed=false
+          [ -n "${names}" ] || done_unchanged "Every mapped key is optional and unset: nothing to write."
+          # shellcheck disable=SC2086  # a list of validated names
+          check_access ${names}
           for name in ${names}; do
             object="${RELEASE}-${name}"
-            before="$(kubectl --namespace "${NAMESPACE}" get secret "${object}" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null)" \
-              || die "Secret ${object} does not exist in ${NAMESPACE}: the platform creates the (empty) object, this workflow only fills it"
             var="DATA_$(printf '%s' "${name}" | tr '-' '_')"
-            printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"%s"},"data":{%s}}\n' "${object}" "${!var}" \
-              | kubectl --namespace "${NAMESPACE}" apply --server-side --field-manager=akjet-app-secrets --force-conflicts -f - >/dev/null \
-              || die "writing Secret ${object} failed (the response is not shown)"
-            after="$(kubectl --namespace "${NAMESPACE}" get secret "${object}" -o jsonpath='{.metadata.resourceVersion}')"
             keys="$(printf '%s' "${!var}" | tr ',' '\n' | cut -d'"' -f2 | tr '\n' ' ')"
-            if [ "${before}" != "${after}" ]; then changed=true; state=updated; else state=unchanged; fi
-            echo "Secret ${object}: ${state}; keys managed from GitHub: ${keys}"
+            printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"%s"},"data":{%s}}\n' "${object}" "${!var}" \
+              | apply_secret "${object}" "${keys}"
             unset "${var}"
           done
-          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+          report_changed
 
       # The migration Job is created before the upgrade and is not part of the Helm release.
       # A failed migration stops the deployment; the schema is never rolled back automatically.

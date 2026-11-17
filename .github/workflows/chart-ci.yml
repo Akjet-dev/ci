@@ -65,7 +65,11 @@ jobs:
           tar -xzf actionlint.tgz actionlint && mv actionlint "${bin}/actionlint"
           echo "${bin}" >> "${GITHUB_PATH}"
 
+      # Optional: a read-only token for the application repositories lets the suite validate their REAL
+      # caller workflows (tests/fetch-consumers.sh). Without it the committed snapshots are validated.
       - name: Run the test suite
+        env:
+          CONSUMERS_READ_TOKEN: ${{ secrets.CONSUMERS_READ_TOKEN }}
         run: tests/run.sh
 
   publish:
