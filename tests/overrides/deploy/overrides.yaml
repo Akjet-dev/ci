@@ -1,0 +1,6 @@
+overrides:
+  DB_HOST: { path: config.DB_HOST, type: host }
+  APP_URL: { path: config.APP_URL, type: url }
+  DB_POOL_SIZE: { path: config.DB_POOL_SIZE, type: integer }
+  FEATURE_PREVIEW: { path: config.FEATURE_PREVIEW, type: boolean }
+  SERVICE_LABEL: { path: config.SERVICE_LABEL }

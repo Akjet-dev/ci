@@ -99,6 +99,7 @@ jobs:
       chart: ${{ steps.target.outputs.chart }}
       digest: ${{ steps.target.outputs.digest }}
       deploy: ${{ steps.target.outputs.deploy }}
+      overrides: ${{ steps.overrides.outputs.json }}
     steps:
       - name: Resolve and check the target
         id: target
@@ -186,6 +187,92 @@ jobs:
         with:
           persist-credentials: false
 
+      # Optional overrides of NON-SENSITIVE configuration by GitHub repository variables of the calling
+      # repository. The values files stay the source of configuration; a variable only replaces a value the
+      # service explicitly allowed in <values-dir>/overrides.yaml:
+      #
+      #   overrides:
+      #     DB_HOST: { path: config.DB_HOST, type: host }     # variable DEV_DB_HOST / STAGE_DB_HOST
+      #
+      # Rules enforced here (not by the caller): only paths config.<NAME> can be overridden - never the image,
+      # release, namespace, runner, security settings, replicas or Secret references; names that look like
+      # credentials are refused; an absent or empty variable changes nothing; a variable of one environment
+      # never applies to the other. Variables are read as data (JSON), never interpolated into a command.
+      - name: Resolve variable overrides
+        id: overrides
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          VALUES_DIR: ${{ inputs.values-dir }}
+          REPOSITORY_VARIABLES: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/overrides.json"
+          allow="${VALUES_DIR}/overrides.yaml"
+          if [ ! -f "${allow}" ]; then
+            echo '{}' > "${out}"
+            echo "json={}" >> "${GITHUB_OUTPUT}"
+            echo "No ${allow}: values files are used as they are."
+            exit 0
+          fi
+          prefix="$(printf '%s' "${ENVIRONMENT}" | tr '[:lower:]' '[:upper:]')_"
+          vars_file="${RUNNER_TEMP}/repository-variables.json"
+          printf '%s' "${REPOSITORY_VARIABLES:-null}" > "${vars_file}"
+          yq -o=json '.' "${allow}" > "${RUNNER_TEMP}/overrides-allow.json"
+          # shellcheck disable=SC2016  # jq program, not shell
+          jq -n --arg prefix "${prefix}" --slurpfile allow "${RUNNER_TEMP}/overrides-allow.json" \
+                --slurpfile vars "${vars_file}" '
+            def fail($m): error($m);
+            ($allow[0] // {}) as $doc
+            | (if ($doc | type) != "object" or (($doc | keys) - ["overrides"] | length) > 0
+               then fail("overrides.yaml: only the top-level key \"overrides\" is allowed") else . end)
+            | ($doc.overrides // {}) as $list
+            | (if ($list | type) != "object" then fail("overrides.yaml: \"overrides\" must be a map") else . end)
+            | (($vars[0] // {}) | if type == "object" then . else {} end) as $v
+            # every entry of the allow-list is checked, whether or not its variable is set
+            | reduce ($list | to_entries[]) as $e ({};
+                ($e.key) as $name
+                | ($e.value | if type == "object" then . else fail("overrides.\($name): must be {path, type}") end) as $spec
+                | (if ($name | test("^[A-Z][A-Z0-9_]{0,62}$")) then . else fail("overrides.\($name): the name must be upper case letters, digits and _") end)
+                | (if (($spec | keys) - ["path", "type"] | length) > 0 then fail("overrides.\($name): only path and type are allowed") else . end)
+                | (($spec.path // "") | tostring) as $path
+                | (if ($path | test("^config\\.[A-Za-z_][A-Za-z0-9_]*$")) then . else fail("overrides.\($name): path \($path) is not allowed - only config.<NAME> can be overridden") end)
+                | ($path | ltrimstr("config.")) as $key
+                | (if ($key | test("PASSWORD|PASSWD|SECRET|TOKEN|ACCESS_KEY|(^|_)KEY$"; "i")) or ($name | test("PASSWORD|PASSWD|SECRET|TOKEN|ACCESS_KEY|(^|_)KEY$"; "i"))
+                   then fail("overrides.\($name): \($key) looks like a credential and cannot come from a GitHub variable") else . end)
+                | (($spec.type // "string") | tostring) as $type
+                | (if (["string", "host", "url", "integer", "boolean"] | index($type)) then . else fail("overrides.\($name): unknown type \($type)") end)
+                | ($v[$prefix + $name]) as $raw
+                | if $raw == null or ($raw | tostring) == "" then .
+                  else ($raw | tostring) as $value
+                  | (if ($value | length) > 2048 or ($value | test("[[:cntrl:]]")) then fail("variable \($prefix)\($name): control characters or more than 2048 characters") else . end)
+                  | (if $type == "host" and ($value | test("^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$") | not) then fail("variable \($prefix)\($name): not a host name or address") else . end)
+                  | (if $type == "url" and ($value | test("^https?://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[^\\s]*)?$") | not) then fail("variable \($prefix)\($name): not an http(s) URL") else . end)
+                  | (if $type == "integer" and ($value | test("^-?[0-9]{1,18}$") | not) then fail("variable \($prefix)\($name): not an integer") else . end)
+                  | (if $type == "boolean" and ($value | test("^(true|false)$") | not) then fail("variable \($prefix)\($name): must be true or false") else . end)
+                  # chart values under config are strings (ConfigMap data); the type was validated above
+                  | .config[$key] = $value
+                  end)
+            # a variable of this environment that the service did not allow is a mistake, not a default
+            | . as $result
+            | ([$v | keys[] | select(startswith($prefix)) | ltrimstr($prefix)] - ($list | keys)) as $unknown
+            | if ($unknown | length) > 0
+              then fail("repository variable(s) \($unknown | map($prefix + .) | join(", ")) are not listed in overrides.yaml")
+              else $result end
+          ' > "${out}" || { echo "::error::variable overrides rejected (see the message above)"; exit 1; }
+          rm -f "${vars_file}"
+          echo "json=$(jq -c '.' "${out}")" >> "${GITHUB_OUTPUT}"
+          applied="$(jq -r '(.config // {}) | keys | join(", ")' "${out}")"
+          if [ -n "${applied}" ]; then
+            echo "Overridden by ${prefix}* repository variables: ${applied}"
+            {
+              echo "### Configuration overrides"
+              echo
+              echo "Values replaced by \`${prefix}*\` repository variables: \`${applied}\`"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "No ${prefix}* override is set: values files are used as they are."
+          fi
+
       - name: Install pinned tools
         run: |
           set -euo pipefail
@@ -237,6 +324,7 @@ jobs:
           common=(
             "${RELEASE}" "${chart_dir}" --namespace "${NAMESPACE}"
             -f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"
+            -f "${RUNNER_TEMP}/overrides.json"
             --set-string "image.digest=${DIGEST}"
           )
           helm lint "${chart_dir}" "${common[@]:2}"
@@ -329,6 +417,15 @@ jobs:
           chmod +x "${bin}/kubectl"
           echo "${bin}" >> "${GITHUB_PATH}"
 
+      # Exactly the overrides the validate job resolved and validated: both jobs render the same configuration.
+      - name: Apply variable overrides
+        env:
+          OVERRIDES: ${{ needs.validate.outputs.overrides }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OVERRIDES}" ]; then OVERRIDES='{}'; fi
+          printf '%s\n' "${OVERRIDES}" > "${RUNNER_TEMP}/overrides.json"
+
       - name: Check the runner identity
         run: |
           set -euo pipefail
@@ -387,6 +484,7 @@ jobs:
           run_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           helm template "${RELEASE}" "${CHART_DIR}" --namespace "${NAMESPACE}" \
             -f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml" \
+            -f "${RUNNER_TEMP}/overrides.json" \
             --set-string "image.digest=${DIGEST}" \
             --set migration.render=true --set-string "migration.runId=${run_id}" \
             --show-only templates/migration-job.yaml > "${RUNNER_TEMP}/migration.yaml"
@@ -419,6 +517,7 @@ jobs:
           args=(
             upgrade --install "${RELEASE}" "${CHART_DIR}" --namespace "${NAMESPACE}"
             -f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"
+            -f "${RUNNER_TEMP}/overrides.json"
             --set-string "image.digest=${DIGEST}"
             --set migration.render=false
             --rollback-on-failure --wait --timeout "${TIMEOUT}" --history-max 20
