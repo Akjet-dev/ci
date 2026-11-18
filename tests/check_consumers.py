@@ -244,7 +244,7 @@ def resolve_identity(workflow_file, snap, environment):
         out = tmp / "out"
         out.write_text("")
         env = {"PATH": os.environ["PATH"], "RUNNER_TEMP": str(tmp / "rt"), "GITHUB_OUTPUT": str(out), "ENVIRONMENT": environment,
-               "VALUES_DIR": "deploy", "RELEASE_INPUT": "", "BUNDLE_SECRET_INPUT": ""}
+               "VALUES_DIR": "deploy", "TIMEOUT": "10m", "RELEASE_INPUT": "", "BUNDLE_SECRET_INPUT": ""}
         run = subprocess.run(["bash", "--noprofile", "--norc", "-c", step], env=env, cwd=tmp, stdin=subprocess.DEVNULL, capture_output=True, text=True)
         if run.returncode != 0:
             msg = [l for l in (run.stdout + run.stderr).splitlines() if l.startswith("::error::")]

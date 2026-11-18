@@ -5,8 +5,10 @@
     "envBundle": {
      "secret": "app"
     },
+    "migrationWaitTimeoutSeconds": 3600,
     "namespace": "dev-lk-backend",
-    "release": "backend"
+    "release": "backend",
+    "rolloutTimeoutSeconds": 1800
    },
    "stage": {
     "envBundle": {
@@ -29,7 +31,7 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
+     "ref": "989d3c432292d7b24f873c943b0b68cc0a7b69f0",
      "secrets": {},
      "uses": "deploy-k8s.yml",
      "with": {
@@ -48,7 +50,7 @@
       "contents": "read",
       "packages": "write"
      },
-     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
+     "ref": "989d3c432292d7b24f873c943b0b68cc0a7b69f0",
      "secrets": {
       "build-secrets": "COMPOSER_AUTH={\"http-basic\":{\"nova.laravel.com\":{\"username\":\"${{ secrets.NOVA_USERNAME }}\",\"password\":\"${{ secrets.NOVA_LICENSE_KEY }}\"}}}\n"
      },
@@ -88,7 +90,7 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
+     "ref": "989d3c432292d7b24f873c943b0b68cc0a7b69f0",
      "secrets": {
       "env-bundle": "${{ secrets.DEV_BACKEND_ENV }}"
      },

@@ -23,7 +23,7 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
+     "ref": "989d3c432292d7b24f873c943b0b68cc0a7b69f0",
      "secrets": {},
      "uses": "deploy-k8s.yml",
      "with": {
@@ -42,7 +42,7 @@
       "contents": "read",
       "packages": "write"
      },
-     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
+     "ref": "989d3c432292d7b24f873c943b0b68cc0a7b69f0",
      "secrets": {},
      "uses": "build-image.yml",
      "with": {
@@ -78,7 +78,7 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
+     "ref": "989d3c432292d7b24f873c943b0b68cc0a7b69f0",
      "secrets": {},
      "uses": "deploy-k8s.yml",
      "with": {

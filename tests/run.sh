@@ -290,7 +290,7 @@ id_values() {  # common values.yaml text, env file text, [environment=dev]
 id_run() {  # environment, [release input], [env-bundle-secret input], [repository] -> outputs in $WORK/id_output
   : >"$WORK/id_output"
   ( cd "$idw" && env -i PATH="$PATH" RUNNER_TEMP="$idw/tmp" GITHUB_OUTPUT="$WORK/id_output" GITHUB_REPOSITORY="${4:-Example-Org/example-api}" \
-      ENVIRONMENT="$1" VALUES_DIR=deploy RELEASE_INPUT="${2:-}" BUNDLE_SECRET_INPUT="${3:-}" bash --noprofile --norc -c "$id_step" ) </dev/null >"$WORK/id.log" 2>&1
+      ENVIRONMENT="$1" TIMEOUT=10m VALUES_DIR=deploy RELEASE_INPUT="${2:-}" BUNDLE_SECRET_INPUT="${3:-}" bash --noprofile --norc -c "$id_step" ) </dev/null >"$WORK/id.log" 2>&1
 }
 id_out() { sed -n "s/^$1=//p" "$WORK/id_output"; }
 id_reject() {  # label, expected text, id_run args
@@ -371,7 +371,7 @@ id_reject "an invalid env-bundle Secret name" "is not a Secret name of requiredS
 if [ -d ../backend/deploy ] && [ -d ../lk-frontend/deploy ]; then
   ws_id() {  # repository directory, environment -> "namespace release"
     : >"$WORK/id_output"
-    ( cd "$1" && env -i PATH="$PATH" RUNNER_TEMP="$WORK/ws-id" GITHUB_OUTPUT="$WORK/id_output" ENVIRONMENT="$2" VALUES_DIR=deploy \
+    ( cd "$1" && env -i PATH="$PATH" RUNNER_TEMP="$WORK/ws-id" GITHUB_OUTPUT="$WORK/id_output" ENVIRONMENT="$2" TIMEOUT=10m VALUES_DIR=deploy \
         RELEASE_INPUT="" BUNDLE_SECRET_INPUT="" bash --noprofile --norc -c "$id_step" ) </dev/null >/dev/null 2>&1 || { echo error; return; }
     echo "$(id_out namespace) $(id_out release)"
   }
@@ -1380,11 +1380,50 @@ else
 fi
 mig_step="$(yq '.jobs.deploy.steps[] | select(.name == "Run the migration Job") | .run' "$dk")"
 migbin="$WORK/migbin"; mkdir -p "$migbin"
-# The fake records the namespace of the request AND the one inside the object, the way the API compares them.
+# A fake cluster on a virtual clock: `date` reads it, `sleep N` advances it - no test really waits.
+# $FAKE_STATE/timeline holds "<second> <state>" lines; the Job is in the last state whose second has passed
+# (no timeline = complete). The fake records the namespace of the request AND the one inside the object,
+# the way the API compares them.
+cat >"$migbin/date" <<'FAKE'
+#!/usr/bin/env bash
+cat "$FAKE_STATE/clock" 2>/dev/null || echo 0
+FAKE
+cat >"$migbin/sleep" <<'FAKE'
+#!/usr/bin/env bash
+now="$(cat "$FAKE_STATE/clock" 2>/dev/null || echo 0)"; echo $(( now + ${1%s} )) >"$FAKE_STATE/clock"
+FAKE
 cat >"$migbin/kubectl" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$FAKE_STATE/mig-calls.log"
+now="$(cat "$FAKE_STATE/clock" 2>/dev/null || echo 0)"
+state="$(awk -v n="$now" '$1 <= n { s = $2 } END { print s }' "$FAKE_STATE/timeline" 2>/dev/null || true)"; state="${state:-complete}"
+if [ "$state" = "late-complete" ]; then   # the first read at this second still sees a running pod
+  if grep -qx "$now" "$FAKE_STATE/late" 2>/dev/null; then state=complete; else echo "$now" >>"$FAKE_STATE/late"; state=running; fi
+fi
+job_json() {
+  case "$state" in
+    pull|backoff|running|nopod) jq -cn '{status: {active: 1}}' ;;
+    pod-done) jq -cn '{status: {succeeded: 1}}' ;;
+    complete) jq -cn '{status: {succeeded: 1, conditions: [{type: "SuccessCriteriaMet", status: "True"}, {type: "Complete", status: "True"}]}}' ;;
+    failed) jq -cn '{status: {failed: 1, conditions: [{type: "Failed", status: "True", reason: "BackoffLimitExceeded", message: "Job has reached the specified backoff limit"}]}}' ;;
+    deadline) jq -cn '{status: {failed: 1, conditions: [{type: "Failed", status: "True", reason: "DeadlineExceeded", message: "Job was active longer than specified deadline"}]}}' ;;
+  esac
+}
+pods_json() {
+  local c
+  case "$state" in
+    nopod) echo '{"items":[]}'; return ;;
+    pull) c='{"state": {"waiting": {"reason": "ContainerCreating"}}}' ;;
+    backoff) c='{"state": {"waiting": {"reason": "ImagePullBackOff", "message": "Back-off pulling image"}}}' ;;
+    running) c='{"state": {"running": {"startedAt": "2026-11-18T10:24:00Z"}}}' ;;
+    pod-done|complete) c='{"state": {"terminated": {"reason": "Completed", "exitCode": 0}}}' ;;
+    failed) c='{"state": {"terminated": {"reason": "Error", "exitCode": 1}}}' ;;
+    deadline) echo '{"items":[]}'; return ;;
+  esac
+  local phase; case "$state" in pull|backoff) phase=Pending ;; running) phase=Running ;; failed) phase=Failed ;; *) phase=Succeeded ;; esac
+  jq -cn --arg p "$phase" --argjson c "$c" '{items: [{metadata: {name: "example-api-migrate-1-1-abcde"}, status: {phase: $p, containerStatuses: [$c]}}]}'
+}
 case "$*" in
   *"dry-run=client"*) echo "a client-side dry run would place the object in the runner namespace arc-runners" >&2; exit 3 ;;
   "--namespace "*" create -f -")
@@ -1393,20 +1432,35 @@ case "$*" in
       echo "error: the namespace from the provided object \"$obj\" does not match the namespace \"$req\"" >&2; exit 1
     fi
     printf '%s' "$doc" >"$FAKE_STATE/job.json"; echo "$req" >"$FAKE_STATE/job.ns" ;;
-  *" get job "*) printf '1/' ;;
-  *" logs "*) echo "migrated" ;;
+  "--namespace "*" get jobs -l "*" -o json") cat "$FAKE_STATE/existing.json" 2>/dev/null || echo '{"items":[]}' ;;
+  "--namespace "*" get job "*" -o json")
+    case "$state" in
+      api-error) echo "Unable to connect to the server: net/http: TLS handshake timeout" >&2; exit 1 ;;
+      forbidden) echo 'Error from server (Forbidden): jobs.batch "example-api-migrate-1-1" is forbidden' >&2; exit 1 ;;
+      gone) echo 'Error from server (NotFound): jobs.batch "example-api-migrate-1-1" not found' >&2; exit 1 ;;
+    esac
+    job_json ;;
+  "--namespace "*" get pods -l job-name="*" -o json") pods_json ;;
+  "--namespace "*" get pods -l job-name="*" -o name") echo "pod/example-api-migrate-1-1-abcde" ;;
+  "--namespace "*" get events "*) printf 'TIME TYPE REASON MESSAGE\n2026-11-18T10:00:00Z Normal Pulling Pulling image\n' ;;
+  "--namespace "*" logs job/"*) [ "${FAKE_LOGS:-}" = "fail" ] && { echo "no logs" >&2; exit 1; }; echo "Migrating: 2026_01_01_000000_create_table ... DONE" ;;
+  "--namespace "*" patch job "*" --type=merge -p "*) echo "$*" >>"$FAKE_STATE/suspended" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 FAKE
-chmod +x "$migbin/kubectl"; ln -sf "$(command -v "$HELM")" "$migbin/helm"
-run_migration_in() {  # directory with deploy/, shadowed names, [namespace], [PATH prefix]
-  rm -f "$sec_state/job.json" "$sec_state/job.ns" "$sec_state/mig-calls.log"; echo '{}' >"$WORK/overrides.json"
-  mkdir -p "$WORK/values"
+chmod +x "$migbin/kubectl" "$migbin/date" "$migbin/sleep"; ln -sf "$(command -v "$HELM")" "$migbin/helm"
+run_migration_in() {  # directory with deploy/, shadowed names, [namespace], [PATH prefix], [wait seconds]
+  rm -f "$sec_state/job.json" "$sec_state/job.ns" "$sec_state/mig-calls.log" "$sec_state/suspended" "$sec_state/late"
+  [ -n "${KEEP_CLOCK:-}" ] || echo 0 >"$sec_state/clock"
+  echo '{}' >"$WORK/overrides.json"; mkdir -p "$WORK/values"
   yq 'del(.deployment)' "$1/deploy/values.yaml" >"$WORK/values/values.yaml"; yq 'del(.deployment)' "$1/deploy/values-dev.yaml" >"$WORK/values/values-dev.yaml"
-  ( cd "$1" && env -i PATH="${4:-$migbin}:$PATH" HOME="$WORK" RUNNER_TEMP="$WORK" GITHUB_STEP_SUMMARY="$WORK/mig_summary" FAKE_STATE="$sec_state" \
-      GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RELEASE=example-api NAMESPACE="${3:-dev-example-api}" ENVIRONMENT=dev VALUES_DIR=deploy TIMEOUT=10s \
-      DIGEST="$good_digest" CHART_DIR="$OLDPWD/$CHART" SHADOWED="$2" bash --noprofile --norc -c "$mig_step" ) </dev/null >"$WORK/mig.log" 2>&1
+  : >"$WORK/mig_summary"
+  ( cd "$1" && env -i PATH="${4:-$migbin}:$migbin:$PATH" HOME="$WORK" RUNNER_TEMP="$WORK" GITHUB_STEP_SUMMARY="$WORK/mig_summary" FAKE_STATE="$sec_state" \
+      FAKE_LOGS="${FAKE_LOGS:-}" GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RELEASE=example-api NAMESPACE="${3:-dev-example-api}" ENVIRONMENT=dev VALUES_DIR=deploy \
+      TIMEOUT=10m MIGRATION_WAIT="${5:-3600}" DIGEST="$good_digest" CHART_DIR="$OLDPWD/$CHART" SHADOWED="$2" bash --noprofile --norc -c "$mig_step" ) </dev/null >"$WORK/mig.log" 2>&1
 }
+timeline() { printf '%s\n' "$@" | tr ';' '\n' | sed 's/^ *//' >"$sec_state/timeline"; }
+rm -f "$sec_state/timeline" "$sec_state/existing.json"
 run_migration() { run_migration_in "$bn_src" "$1"; }
 job_env() { jq -r '[.spec.template.spec.containers[0].env[] | .name + "=" + .value] | join(" ")' "$sec_state/job.json"; }
 if run_migration "" && [ "$(job_env)" = "APP_ENV=dev DB_HOST=db.default.example.test DB_PORT=5432 DB_USERNAME=example_migrator FEATURE_WRITES_ENABLED=false LOG_CHANNEL=stderr" ]; then
@@ -1462,6 +1516,163 @@ printf "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: other\n"
 if run_migration_in "$bn_src" "" dev-example-api "$fakehelm"; then fail "a non-Job migration object was created"
 elif grep -qF "expected Job example-api-migrate-1-1 in dev-example-api" "$WORK/mig.log"; then pass "an object other than the expected Job is refused"
 else fail "non-Job migration object"; cat "$WORK/mig.log"; fi
+
+echo "== deploy-k8s.yml: the migration Job is watched until Kubernetes reports it finished"
+mig_ok() {  # label, timeline, [wait] -> step must be green
+  local label="$1"; timeline "$2"
+  if run_migration_in "$bn_src" "" dev-example-api "" "${3:-3600}" && grep -q 'Complete=True after' "$WORK/mig.log" \
+     && grep -qF 'succeeded' "$WORK/mig_summary"; then pass "$label"; else fail "$label"; tail -25 "$WORK/mig.log"; fi
+}
+mig_fail() {  # label, expected text, timeline, [wait] -> step must fail with the text
+  local label="$1" text="$2"; timeline "$3"
+  if run_migration_in "$bn_src" "" dev-example-api "" "${4:-3600}"; then fail "accepted: $label"; tail -15 "$WORK/mig.log"
+  elif grep -qF -- "$text" "$WORK/mig.log"; then pass "$label"
+  else fail "failed for another reason: $label"; tail -20 "$WORK/mig.log"; fi
+}
+mig_ok "an image pull of 24 minutes, then 9 s of migration: the step is green (the old 10-minute limit would have failed it)" "0 pull; 1433 running; 1442 complete"
+if [ "$(cat "$sec_state/clock")" -ge 1442 ] && grep -qE 'Complete=True after 14[4-5][0-9] s' "$WORK/mig.log" && ! grep -q '::error::' "$WORK/mig.log"; then
+  pass "  ... it waited through the pull (about 1440 s) without an error"
+else fail "duration of the 24-minute scenario"; grep -E 'Complete|error' "$WORK/mig.log"; fi
+if grep -q 'container waiting: ContainerCreating (image pull or container start in progress)' "$WORK/mig.log" \
+   && [ "$(grep -cE '^\[[0-9]{2}:[0-9]{2}\] example-api-migrate-1-1: active=1' "$WORK/mig.log")" -ge 24 ] \
+   && [ "$(grep -cE '^\[[0-9]{2}:[0-9]{2}\]' "$WORK/mig.log")" -le 30 ]; then
+  pass "  ... ContainerCreating is a waiting state, reported about once a minute (not every poll)"
+else fail "progress reporting during the pull"; grep -cE '^\[' "$WORK/mig.log"; fi
+if [ "$(grep -c ' get job example-api-migrate-1-1 -o json' "$sec_state/mig-calls.log")" -ge 140 ] && ! grep -q 'logs job/' <(head -n -3 "$sec_state/mig-calls.log"); then
+  pass "  ... the Job is polled about every 10 s by its exact name, and no log is requested while the container is not running"
+else fail "polling pattern"; fi
+mig_ok "a migration that finishes within the configured wait is green" "0 pull; 30 running; 40 complete"
+mig_fail "the same 24-minute run with only 10 minutes of wait fails (the limit is the configured wait, nothing else)" "did not start its container within 600 s" "0 pull; 1433 running; 1442 complete" 600
+mig_fail "a running pod alone is not success: the Job keeps running past the wait" "the migration may still be changing the database. It is NOT stopped by this workflow" "0 running" 120
+if [ ! -e "$sec_state/suspended" ] && ! grep -q ' delete ' "$sec_state/mig-calls.log"; then
+  pass "  ... a Job whose container has started is neither deleted nor suspended"
+else fail "a started migration was interrupted"; fi
+mig_ok "the pod succeeded before the Job reported Complete: the step waits for Complete" "0 running; 50 pod-done; 80 complete"
+mig_ok "the pod succeeded at the deadline: a short extension lets the Job report Complete" "0 running; 55 pod-done; 100 complete" 60
+mig_ok "Complete appears at the deadline boundary: the final read counts it" "0 running; 60 late-complete" 60
+mig_fail "a failed Job fails the step with its reason" "migration Job example-api-migrate-1-1 failed (BackoffLimitExceeded); the upgrade does not run" "0 pull; 20 running; 40 failed"
+if grep -q 'condition Failed=True BackoffLimitExceeded' "$WORK/mig.log" && grep -q 'container terminated: Error exit 1' "$WORK/mig.log" \
+   && grep -q 'migration output (last 200 lines)' "$WORK/mig.log" && grep -q 'Normal Pulling' "$WORK/mig.log"; then
+  pass "  ... with its conditions, container state, events and log"
+else fail "diagnostics of a failed Job"; tail -20 "$WORK/mig.log"; fi
+mig_fail "ImagePullBackOff until Kubernetes ends the Job: failed with DeadlineExceeded" "failed (DeadlineExceeded)" "0 backoff; 3300 deadline" 3420
+if grep -q '::warning::migration Job example-api-migrate-1-1: container waiting with ImagePullBackOff' "$WORK/mig.log" \
+   && [ "$(grep -c 'ImagePullBackOff - Kubernetes keeps retrying' "$WORK/mig.log")" = "1" ] \
+   && grep -q 'no migration output: the container never started' "$WORK/mig.log" && ! grep -q 'logs job/' "$sec_state/mig-calls.log"; then
+  pass "  ... ImagePullBackOff is reported once, and no log is requested from a container that never started"
+else fail "ImagePullBackOff diagnostics"; grep -E 'warning|output' "$WORK/mig.log"; fi
+mig_ok "transient API errors (four polls) are retried" "0 pull; 20 api-error; 60 complete"
+mig_fail "a persistently unreachable API stops the step after a bounded number of retries" "the Kubernetes API did not answer 6 times in a row" "0 api-error"
+mig_fail "Forbidden is not swallowed" "the runner may not read Job example-api-migrate-1-1 in dev-example-api (Forbidden / Unauthorized)" "0 pull; 30 forbidden"
+mig_fail "a Job that disappears while waiting is detected" "disappeared from dev-example-api before it finished" "0 pull; 50 gone"
+mig_fail "the wait ends while the container never started: the Job is suspended, not deleted" "it was suspended so that it cannot start later (the Job object is kept for inspection)" "0 pull" 120
+if grep -q 'patch job example-api-migrate-1-1 --type=merge -p {"spec":{"suspend":true}}' "$sec_state/suspended" && ! grep -q ' delete ' "$sec_state/mig-calls.log"; then
+  pass "  ... by a suspend patch of exactly that Job"
+else fail "suspension of a never-started Job"; fi
+FAKE_LOGS=fail mig_fail "an unavailable log does not hide the failure" "failed (BackoffLimitExceeded)" "0 running; 30 failed"
+if grep -q '(the log of example-api-migrate-1-1 is not available)' "$WORK/mig.log"; then pass "  ... and is reported as unavailable"; else fail "unavailable log handling"; fi
+timeline "0 pull; 1433 running; 1442 complete"; run_migration_in "$bn_src" "" dev-example-api "" 3600
+calls_total="$(wc -l <"$sec_state/mig-calls.log" | tr -d ' ')"
+if [ "$(grep -c -- '--namespace dev-example-api ' "$sec_state/mig-calls.log")" = "${calls_total}" ] && [ "${calls_total}" -gt 100 ]; then
+  pass "every one of the ${calls_total} kubectl calls of the migration step names the application namespace"
+else fail "kubectl calls without the namespace"; grep -v -- '--namespace dev-example-api ' "$sec_state/mig-calls.log" | head -3; fi
+if [ "$(jq -r '.spec.template.spec.containers[0].image' "$sec_state/job.json")" = "ghcr.io/example-org/example-api@$good_digest" ]; then
+  pass "the migration Job runs exactly the image digest of the deployment"
+else fail "image of the migration Job"; fi
+if ! grep -qE 'DB_HOST=|db\.default\.example\.test|LOG_CHANNEL=|"env"' "$WORK/mig.log"; then
+  pass "the step prints no environment variable of the Job (states, reasons and events only)"
+else fail "the migration step printed environment values"; fi
+
+# Two runs of one release: a Job that has not finished blocks the next one before it is created.
+jq -cn '{items: [{metadata: {name: "example-api-migrate-0-1"}, status: {active: 1}}]}' >"$sec_state/existing.json"
+mig_fail "an unfinished migration Job of the same release blocks a second migration" "migration Job(s) example-api-migrate-0-1 of example-api in dev-example-api have not finished; a second migration is not started" "0 complete"
+if ! grep -q ' create -f -' "$sec_state/mig-calls.log"; then pass "  ... nothing is created"; else fail "a second migration Job was created"; fi
+jq -cn '{items: [{metadata: {name: "a"}, status: {conditions: [{type: "Complete", status: "True"}]}}, {metadata: {name: "b"}, status: {conditions: [{type: "Failed", status: "True"}]}}, {metadata: {name: "c"}, status: {conditions: [{type: "Suspended", status: "True"}]}}]}' >"$sec_state/existing.json"
+mig_ok "finished, failed and suspended Jobs of earlier runs do not block" "0 complete"
+if grep -qF 'get jobs -l app.kubernetes.io/instance=example-api,app.kubernetes.io/component=migration -o json' "$sec_state/mig-calls.log"; then
+  pass "  ... the check looks only at migration Jobs of this release (instance + component labels)"
+else fail "selector of the running-migration check"; fi
+rm -f "$sec_state/existing.json"
+
+# Green migration -> the upgrade runs with the same digest; red migration -> it does not (GitHub skips the
+# remaining steps after a failure: the upgrade step has no `if`).
+up_step="$(yq '.jobs.deploy.steps[] | select(.name == "Helm upgrade") | .run' "$dk")"
+cat >"$migbin/fakehelm-upgrade" <<'FAKE'
+#!/usr/bin/env bash
+echo "helm $*" >>"$FAKE_STATE/helm-calls.log"
+FAKE
+chmod +x "$migbin/fakehelm-upgrade"; upbin="$WORK/upbin"; mkdir -p "$upbin"; cp "$migbin/fakehelm-upgrade" "$upbin/helm"
+deploy_steps() {  # timeline -> runs the migration step, then the upgrade step only if it was green
+  rm -f "$sec_state/helm-calls.log"; timeline "$1"
+  run_migration_in "$bn_src" "" dev-example-api "" 3600 || return 1
+  ( cd "$bn_src" && env -i PATH="$upbin:$PATH" RUNNER_TEMP="$WORK" FAKE_STATE="$sec_state" GITHUB_SHA=abc GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 \
+      RELEASE=example-api NAMESPACE=dev-example-api ENVIRONMENT=dev DIGEST="$good_digest" CHART_DIR=chart ROLLOUT_TIMEOUT=1800 \
+      OWNER_LABEL_VALUE=akjet.kz/source-repository=x RESTART=false SECRETS_CHANGED=false bash --noprofile --norc -c "$up_step" ) </dev/null >"$WORK/up.log" 2>&1
+}
+if [ "$(yq '.jobs.deploy.steps[] | select(.name == "Helm upgrade") | has("if")' "$dk")" = "false" ] \
+   && deploy_steps "0 pull; 1433 running; 1442 complete" \
+   && grep -qF "image.digest=$good_digest" "$sec_state/helm-calls.log" && grep -qF -- '--timeout 1800s' "$sec_state/helm-calls.log"; then
+  pass "a green migration continues to helm upgrade with the same digest and the rollout timeout of the values"
+else fail "upgrade after a green migration"; cat "$WORK/up.log" "$sec_state/helm-calls.log" 2>/dev/null; fi
+if deploy_steps "0 running; 30 failed"; then fail "the upgrade ran after a failed migration"
+elif [ ! -e "$sec_state/helm-calls.log" ]; then pass "a failed migration stops the deployment: helm upgrade does not run"
+else fail "helm upgrade ran after a failed migration"; fi
+if [ "$(yq '.jobs.deploy.steps[] | select(.name == "Verify the rollout") | has("if")' "$dk")" = "false" ]; then
+  pass "the rollout verification follows the upgrade (no condition that could skip it)"
+else fail "rollout verification condition"; fi
+
+echo "== deploy-k8s.yml: migration wait and rollout timeout come from the values"
+id_values $'deployment:\n  release: example-api\n  migrationWaitTimeoutSeconds: 3600\n  rolloutTimeoutSeconds: 1800' $'deployment:\n  namespace: dev-example-api'
+if id_run dev && [ "$(id_out migration-wait)/$(id_out rollout-timeout)" = "3600/1800" ]; then
+  pass "deployment.migrationWaitTimeoutSeconds and deployment.rolloutTimeoutSeconds are read from the values"
+else fail "timeouts from values"; cat "$WORK/id.log"; fi
+id_values "$base_common" $'deployment:\n  namespace: dev-example-api'
+if id_run dev && [ "$(id_out migration-wait)/$(id_out rollout-timeout)" = "/600" ]; then
+  pass "without them: no fixed migration wait (derived from the Job deadline later) and the rollout timeout of the input (10m)"
+else fail "timeout defaults: $(id_out migration-wait)/$(id_out rollout-timeout)"; fi
+for bad in 0 30 5401 '"3600"' 1.5 -60; do
+  id_values $'deployment:\n  release: example-api\n  migrationWaitTimeoutSeconds: '"$bad" $'deployment:\n  namespace: dev-example-api'
+  id_reject "migrationWaitTimeoutSeconds: $bad" "deployment.migrationWaitTimeoutSeconds must be a whole number of seconds between 60 and 5400" dev
+done
+id_values $'deployment:\n  release: example-api\n  rolloutTimeoutSeconds: 7200' $'deployment:\n  namespace: dev-example-api'
+id_reject "rolloutTimeoutSeconds: 7200" "deployment.rolloutTimeoutSeconds must be a whole number of seconds between 60 and 3600" dev
+
+render_step="$(yq '.jobs.validate.steps[] | select(.id == "render") | .run' "$dk")"
+render_run() {  # directory, migration wait, rollout timeout, run-migrations -> outputs in $WORK/render_output
+  : >"$WORK/render_output"; rm -rf "$WORK/rt"; mkdir -p "$WORK/rt/values"; echo '{}' >"$WORK/rt/overrides.json"
+  yq 'del(.deployment)' "$1/deploy/values.yaml" >"$WORK/rt/values/values.yaml"; yq 'del(.deployment)' "$1/deploy/values-dev.yaml" >"$WORK/rt/values/values-dev.yaml"
+  ( cd "$1" && env -i PATH="$PATH" HOME="$WORK" RUNNER_TEMP="$WORK/rt" GITHUB_OUTPUT="$WORK/render_output" ENVIRONMENT=dev DIGEST="$good_digest" \
+      CHART_VERSION=0.1.0 VALUES_DIR=deploy RUN_MIGRATIONS="$4" NAMESPACE=dev-example-api RELEASE=example-api CHART="$OLDPWD/$CHART" GITHUB_TOKEN=x \
+      MIGRATION_WAIT="$2" ROLLOUT_TIMEOUT="$3" DEPLOY_JOB_SECONDS="$(yq '.env.DEPLOY_JOB_SECONDS' "$OLDPWD/$dk")" \
+      DEPLOY_OVERHEAD_SECONDS="$(yq '.env.DEPLOY_OVERHEAD_SECONDS' "$OLDPWD/$dk")" bash --noprofile --norc -c "$render_step" ) </dev/null >"$WORK/render.log" 2>&1
+}
+rw="$WORK/render-src"; rm -rf "$rw"; mkdir -p "$rw"; cp -R "$bn_src/deploy" "$rw/"; yq -i '.migration.activeDeadlineSeconds = 3300' "$rw/deploy/values.yaml"
+if render_run "$rw" 3600 1800 true && grep -qx 'migration-wait=3600' "$WORK/render_output"; then
+  pass "Job deadline 3300 s, watched for 3600 s, rollout 1800 s: accepted (the backend DEV values)"
+else fail "backend-like timeouts"; tail -5 "$WORK/render.log"; fi
+if render_run "$rw" "" 600 true && grep -qx 'migration-wait=3420' "$WORK/render_output"; then
+  pass "without a configured wait the Job is watched for its deadline plus 120 s (3300 -> 3420)"
+else fail "derived migration wait"; tail -5 "$WORK/render.log"; fi
+if render_run "$rw" 3300 600 true; then fail "a wait that does not outlast the Job deadline was accepted"
+elif grep -qF 'migration.activeDeadlineSeconds (3300) must end at least 60 s before deployment.migrationWaitTimeoutSeconds (3300)' "$WORK/render.log"; then
+  pass "a Job that could outlive the watch is refused before any cluster access"
+else fail "deadline / wait check"; tail -3 "$WORK/render.log"; fi
+yq -i '.migration.activeDeadlineSeconds = 5300' "$rw/deploy/values.yaml"
+if render_run "$rw" 5400 3600 true; then fail "a configuration beyond the deploy job budget was accepted"
+elif grep -qF 'exceed the deploy job budget of 7200 s' "$WORK/render.log"; then pass "migration wait + rollout + overhead beyond the 120-minute deploy job are refused"
+else fail "budget check"; tail -3 "$WORK/render.log"; fi
+if render_run "$rw" "" 600 false && grep -qx 'migration-wait=0' "$WORK/render_output"; then
+  pass "a deployment without migrations is unaffected (no migration wait)"
+else fail "render without migrations"; tail -3 "$WORK/render.log"; fi
+if [ "$(yq '.jobs.deploy.timeout-minutes' "$dk")" = "$(( $(yq '.env.DEPLOY_JOB_SECONDS' "$dk") / 60 ))" ] && [ "$(yq '.jobs.deploy.timeout-minutes' "$dk")" = "120" ]; then
+  pass "the deploy job timeout (120 min) equals the budget the validate job checks"
+else fail "deploy job timeout and budget differ"; fi
+# shellcheck disable=SC2016  # literal workflow text
+if [ "$(yq '.jobs.deploy.concurrency.group' "$dk")" = 'deploy-k8s-dev-${{ needs.validate.outputs.namespace }}-${{ needs.validate.outputs.release }}' ] \
+   && [ "$(yq '.jobs.deploy.concurrency.cancel-in-progress' "$dk")" = "false" ]; then
+  pass "one deployment per resolved target (namespace + release) at a time; a running one is never cancelled"
+else fail "concurrency key"; fi
+if ! grep -nE 'TIMEOUT%\[sm\]' <<<"$mig_step"; then pass "the migration wait no longer uses the Helm timeout input"; else fail "the migration step still uses the Helm timeout"; fi
 
 echo "== deploy-k8s.yml: the deploy job re-reads the target and checks release ownership"
 prep_step="$(yq '.jobs.deploy.steps[] | select(.name == "Prepare values") | .run' "$dk")"
