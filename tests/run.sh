@@ -648,8 +648,32 @@ case "$*" in
     case " ${FAKE_DENY:-} " in *" ${verb}:${obj#secret/} "*) exit 1 ;; esac
     exit 0 ;;
   *" get secret "*)
-    name="$5"; test -f "$FAKE_STATE/$name.rv" || { echo "Error from server (NotFound)" >&2; exit 1; }
+    name="$5"
+    case "${FAKE_GET:-}" in
+      forbidden) echo "Error from server (Forbidden): secrets \"$name\" is forbidden: User cannot get resource" >&2; exit 1 ;;
+      unreachable) echo "Unable to connect to the server: EOF" >&2; exit 1 ;;
+    esac
+    test -f "$FAKE_STATE/$name.rv" || { echo "Error from server (NotFound): secrets \"$name\" not found" >&2; exit 1; }
     cat "$FAKE_STATE/$name.rv" ;;
+  *" create -f -")
+    doc="$(cat)"; name="$(jq -r '.metadata.name' <<<"$doc")"
+    [ "$(jq -r '.kind + "/" + .apiVersion + "/" + .type' <<<"$doc")" = "Secret/v1/Opaque" ] || { echo "error: not an Opaque Secret" >&2; exit 1; }
+    case "${FAKE_CREATE:-}" in
+      forbidden) echo "Error from server (Forbidden): secrets is forbidden: User cannot create resource" >&2; exit 1 ;;
+      race) printf '{"OTHER_WRITER":"b3RoZXI="}' >"$FAKE_STATE/$name.json"; echo 5 >"$FAKE_STATE/$name.rv" ;;   # someone created it first
+    esac
+    if [ -f "$FAKE_STATE/$name.rv" ]; then echo "Error from server (AlreadyExists): secrets \"$name\" already exists" >&2; exit 1; fi
+    jq -cS '.data' <<<"$doc" >"$FAKE_STATE/$name.json"; echo 1 >"$FAKE_STATE/$name.rv"; echo created >>"$FAKE_STATE/$name.created"
+    echo "secret/$name created" ;;
+  *" patch secret "*" --type=merge --patch-file=/dev/stdin")
+    name="$5"; doc="$(cat)"
+    case "${FAKE_PATCH:-}" in forbidden) echo "Error from server (Forbidden): secrets \"$name\" is forbidden: User cannot patch resource" >&2; exit 1 ;; esac
+    test -f "$FAKE_STATE/$name.rv" || { echo "Error from server (NotFound): secrets \"$name\" not found" >&2; exit 1; }
+    [ "$(jq -c 'keys' <<<"$doc")" = '["data"]' ] || { echo "error: the patch must carry data only" >&2; exit 1; }
+    old="$(cat "$FAKE_STATE/$name.json" 2>/dev/null || echo '{}')"; [ -n "$old" ] || old='{}'
+    new="$(jq -cS -n --argjson a "$old" --argjson b "$(jq -c '.data' <<<"$doc")" '$a + $b')"
+    if [ "$new" != "$(jq -cS . <<<"$old")" ]; then printf '%s' "$new" >"$FAKE_STATE/$name.json"; echo $(( $(cat "$FAKE_STATE/$name.rv") + 1 )) >"$FAKE_STATE/$name.rv"; fi
+    echo "secret/$name patched" ;;
   *" apply --server-side --field-manager=akjet-app-secrets --force-conflicts -f -")
     doc="$(cat)"; name="$(jq -r '.metadata.name' <<<"$doc")"
     [ "$(jq -r '.kind + "/" + .apiVersion' <<<"$doc")" = "Secret/v1" ] || exit 1
@@ -756,10 +780,11 @@ else
 fi
 sec_reset example-api-app
 sec_reject "a Secret object the platform has not created" "Secret example-api-migrate does not exist" "$(printf 'migrate.DB_PASSWORD=x\n')"
-if grep -q 'create' <<<"$sec_step" && ! grep -qE 'kubectl[^|]* create|can-i "?create' <<<"$sec_step"; then
-  pass "the Secret step never creates Secret objects"
+if [ "$(grep -cE 'kubectl [^|]*create -f -' <<<"$sec_step")" = "1" ] && [ "$(grep -c 'can-i create secrets' <<<"$sec_step")" = "1" ] \
+   && ! grep -qE 'kubectl [^|]*(delete|replace|get secrets|get secret -|list)' <<<"$sec_step" && ! grep -q -- '--all-namespaces\|-A ' <<<"$sec_step"; then
+  pass "the Secret step creates a Secret in one place only (pass-through), and never deletes, replaces or lists Secrets"
 else
-  fail "the Secret step must not create Secret objects"
+  fail "create / delete / list calls in the Secret step"
 fi
 for tpl in "${templates[@]}"; do
   if grep -qE 'secrets: *inherit' "$tpl"; then fail "$tpl uses secrets: inherit"; fi
@@ -1100,51 +1125,124 @@ fi
 # without the input the SAME bundle is still judged by the declared mode (other services are unaffected)
 bn_reject "the same bundle without env-bundle-secret (declared mode unchanged)" "NEVER_DECLARED_ANYWHERE is declared neither in requiredSecrets" dev "$pt_bundle"
 
-# deploy side
+# deploy side: the Secret is created on the first deployment and merged into afterwards
 pt_check dev "$pt_bundle"; pt_plan="$(pt_out plan)"; pt_shadowed="$(pt_out shadowed)"
-pt_provision() {  # bundle, plan, [secret=app], [declared], [denied]
+pt_provision() {  # bundle, plan, [secret=app], [declared], [denied]; FAKE_GET / FAKE_CREATE / FAKE_PATCH from the environment
   : >"$WORK/sec_output"
   env -i PATH="$fakebin:$PATH" GITHUB_OUTPUT="$WORK/sec_output" RUNNER_TEMP="$WORK" FAKE_STATE="$sec_state" FAKE_DENY="${5:-}" \
+    FAKE_GET="${FAKE_GET:-}" FAKE_CREATE="${FAKE_CREATE:-}" FAKE_PATCH="${FAKE_PATCH:-}" \
     NAMESPACE=dev-example-api RELEASE=example-api VALUES_DIR=deploy ENVIRONMENT=dev APP_SECRETS="" \
     ENV_BUNDLE="$1" PLAN="$2" BUNDLE_SECRET="${3-app}" DECLARED="${4-$bn_declared}" bash --noprofile --norc -c "$sec_step" </dev/null >"$WORK/sec.log" 2>&1
 }
-sec_reset example-api-app example-api-migrate
-if pt_provision "$pt_bundle" "$pt_plan" && [ "$(cat "$WORK/sec_output")" = "changed=true" ] \
-   && [ "$(sec_data example-api-app REDIS_HOST)" = "127.0.0.1" ] && [ "$(sec_data example-api-app NEVER_DECLARED_ANYWHERE)" = "$pt_secret" ] \
+pt_no_leak() { ! grep -v '^::add-mask::' "$WORK/sec.log" | grep -qF -e "$pt_secret" -e 'app-pw' -e 'mig-pw' -e 'третья строка' -e 'not a host name' \
+                 && ! grep -qF -e "$pt_secret" -e 'app-pw' -e 'mig-pw' "$WORK/sec_output" "$sec_state/calls.log"; }
+pt_writes() { grep -cE ' (create -f -|patch secret |apply )' "$sec_state/calls.log" || true; }
+# one Secret only: the plan of a service without aliases (what backend sends)
+pt_single="$(tr ' ' '\n' <<<"$pt_plan" | grep -v '^migrate\.' | tr '\n' ' ' | sed 's/ $//')"
+pt_keys='["APP_URL","DB_HOST","DB_PASSWORD","DB_USERNAME","FEATURE_WRITES_ENABLED","FLAG_AS_BOOLEAN","NEVER_DECLARED_ANYWHERE","PARTNER_CERTIFICATE","PORT_AS_NUMBER","REDIS_HOST","lowerCase_name"]'
+
+sec_reset   # first deployment: the namespace holds no application Secret at all
+if pt_provision "$pt_bundle" "$pt_single" && [ "$(cat "$WORK/sec_output")" = "changed=true" ] \
+   && [ "$(jq -c 'keys' "$sec_state/example-api-app.json")" = "$pt_keys" ] && [ "$(wc -l <"$sec_state/example-api-app.created" | tr -d ' ')" = "1" ] \
+   && grep -qF 'Secret example-api-app: created with 11 key(s)' "$WORK/sec.log" && ! grep -q ' patch secret \| apply ' "$sec_state/calls.log"; then
+  pass "first deployment: the missing Secret is created by ONE request that carries the complete payload (no empty Secret first, no patch)"
+else
+  fail "creation of the missing Secret"; grep -v '^::add-mask::' "$WORK/sec.log"; cat "$sec_state/calls.log"
+fi
+if [ "$(sec_data example-api-app REDIS_HOST)" = "127.0.0.1" ] && [ "$(sec_data example-api-app NEVER_DECLARED_ANYWHERE)" = "$pt_secret" ] \
    && [ "$(sec_data example-api-app DB_HOST)" = "127.0.0.1:5432 not a host name" ] && [ "$(sec_data example-api-app PORT_AS_NUMBER)" = "6379" ] \
-   && [ "$(sec_data example-api-app FLAG_AS_BOOLEAN)" = "false" ] && [ "$(sec_data example-api-app lowerCase_name)" = "x" ] \
+   && [ "$(sec_data example-api-app FLAG_AS_BOOLEAN)" = "false" ] && [ "$(sec_data example-api-app DB_USERNAME)" = "runtime_role" ] \
+   && [ "$(sec_data example-api-app DB_PASSWORD)" = "app-pw" ] \
    && [ "$(jq -r '.PARTNER_CERTIFICATE | @base64d' "$sec_state/example-api-app.json"; echo x)" = "$(printf '%s\nx' "$cert")" ] \
    && [ "$(jq -r 'has("EMPTY_IS_ABSENT")' "$sec_state/example-api-app.json")" = "false" ]; then
-  pass "pass-through: every value reaches the application Secret unchanged (multi-line, quotes, non-ASCII); an empty value is not written"
+  pass "every <ENV>_<NAME> entry is in the created Secret as NAME, value unchanged (multi-line, quotes, non-ASCII, numbers, booleans); an empty value is not written"
 else
-  fail "pass-through provisioning"; grep -v '^::add-mask::' "$WORK/sec.log"
+  fail "content of the created Secret"
 fi
-if [ "$(sec_data example-api-migrate DB_PASSWORD)" = "mig-pw" ] && [ "$(jq -c 'keys' "$sec_state/example-api-migrate.json")" = '["DB_PASSWORD"]' ] \
-   && [ "$(sec_data example-api-app DB_PASSWORD)" = "app-pw" ] && [ "$(jq -r 'has("DB_MIGRATOR_PASSWORD")' "$sec_state/example-api-app.json")" = "false" ] \
-   && ! grep -q 'bWlnLXB3' "$sec_state/example-api-app.json"; then
-  pass "pass-through: the migration password is DB_PASSWORD of the migrate Secret only; it never reaches the application Secret"
+if [ ! -e "$sec_state/example-api-migrate.rv" ] && ! grep -q 'migrate' "$sec_state/calls.log"; then
+  pass "a service without aliases writes exactly one Secret: no migrate Secret is created, read or referenced"
 else
-  fail "migration password isolation in pass-through mode"
+  fail "a second Secret was touched"; cat "$sec_state/calls.log"
 fi
-if ! grep -v '^::add-mask::' "$WORK/sec.log" | grep -qF -e "$pt_secret" -e 'app-pw' -e 'mig-pw' -e 'третья строка' && ! grep -qF -e "$pt_secret" -e 'mig-pw' "$WORK/sec_output" "$sec_state/calls.log"; then
-  pass "pass-through: no value in the log, the outputs or a command line"
+if pt_no_leak; then pass "creation: no value in the log, the outputs or a command line"; else fail "a value leaked while creating the Secret"; grep -v '^::add-mask::' "$WORK/sec.log"; fi
+: >"$sec_state/calls.log"
+if pt_provision "$pt_bundle" "$pt_single" && [ "$(cat "$WORK/sec_output")" = "changed=false" ] && ! grep -q ' create -f -' "$sec_state/calls.log" \
+   && [ "$(wc -l <"$sec_state/example-api-app.created" | tr -d ' ')" = "1" ] && grep -qF 'Secret example-api-app: unchanged' "$WORK/sec.log"; then
+  pass "repeated deployment with the same bundle: the Secret is neither recreated nor modified, and no restart is requested"
 else
-  fail "a pass-through value leaked on the deploy side"; grep -v '^::add-mask::' "$WORK/sec.log"
+  fail "idempotent repeated deployment"; cat "$WORK/sec_output"; grep -v '^::add-mask::' "$WORK/sec.log"
 fi
-sec_reset example-api-app example-api-migrate
+# an existing Secret with keys of other origin; the new bundle no longer carries REDIS_HOST
+jq -c '. + {"WRITTEN_BY_SOMEONE_ELSE": "a2VlcA=="}' "$sec_state/example-api-app.json" >"$sec_state/tmp.json" && mv "$sec_state/tmp.json" "$sec_state/example-api-app.json"
+pt_smaller="$(jq -c 'del(.DEV_REDIS_HOST) | .DEV_DB_PASSWORD = "rotated-pw" | .DEV_ADDED_LATER = "new"' <<<"$pt_bundle")"
+pt_check dev "$pt_smaller"; pt_smaller_plan="$(tr ' ' '\n' <<<"$(pt_out plan)" | grep -v '^migrate\.' | tr '\n' ' ' | sed 's/ $//')"
+if pt_provision "$pt_smaller" "$pt_smaller_plan" && [ "$(cat "$WORK/sec_output")" = "changed=true" ] \
+   && [ "$(sec_data example-api-app DB_PASSWORD)" = "rotated-pw" ] && [ "$(sec_data example-api-app ADDED_LATER)" = "new" ] \
+   && grep -qF 'Secret example-api-app: updated' "$WORK/sec.log" && ! grep -q ' create -f -' <(tail -n +1 "$sec_state/calls.log" | tail -8); then
+  pass "later deployment: the existing Secret is updated in place - a rotated value and a new variable arrive, and a restart is requested"
+else
+  fail "update of the existing Secret"; grep -v '^::add-mask::' "$WORK/sec.log"
+fi
+if [ "$(sec_data example-api-app WRITTEN_BY_SOMEONE_ELSE)" = "keep" ] && [ "$(sec_data example-api-app REDIS_HOST)" = "127.0.0.1" ]; then
+  pass "keys that are not in the bundle are preserved: a key of other origin stays, and a key dropped from the bundle is not removed"
+else
+  fail "unrelated keys were changed or removed: $(jq -c 'keys' "$sec_state/example-api-app.json")"
+fi
+# with an alias (services that keep a separate migration Secret): both Secrets are created, the passwords stay apart
+sec_reset
+if pt_provision "$pt_bundle" "$pt_plan" && [ "$(sec_data example-api-migrate DB_PASSWORD)" = "mig-pw" ] && [ "$(jq -c 'keys' "$sec_state/example-api-migrate.json")" = '["DB_PASSWORD"]' ] \
+   && [ "$(sec_data example-api-app DB_PASSWORD)" = "app-pw" ] && [ "$(jq -r 'has("DB_MIGRATOR_PASSWORD")' "$sec_state/example-api-app.json")" = "false" ]; then
+  pass "an aliased entry still goes to its own Secret only (services with a separate migration password are unaffected)"
+else
+  fail "aliased entry in pass-through mode"; grep -v '^::add-mask::' "$WORK/sec.log"
+fi
+
 pt_reject_deploy() {  # label, text, pt_provision args
   local label="$1" text="$2"; shift 2
   if pt_provision "$@"; then fail "accepted: $label"
   elif ! grep -qF -- "$text" "$WORK/sec.log"; then fail "rejected for another reason: $label"; grep -v '^::add-mask::' "$WORK/sec.log"
-  elif grep -q ' apply ' "$sec_state/calls.log"; then fail "$label: a Secret was written before the failure"
+  elif [ "$(pt_writes)" != "0" ]; then fail "$label: the cluster was modified before the failure"; cat "$sec_state/calls.log"
+  elif ! pt_no_leak; then fail "$label: a value appears in the output"
   else pass "rejected, nothing written: $label"; fi
 }
-pt_reject_deploy "an undeclared key without pass-through (the input is what opens the Secret)" "app.REDIS_HOST is not declared in requiredSecrets" "$pt_bundle" "$pt_plan" ""
+sec_reset
+pt_reject_deploy "the Secret is missing and the runner may not create Secrets" "does not exist in dev-example-api and the runner may not create it: its Role needs create on Secrets" "$pt_bundle" "$pt_single" app "$bn_declared" "create:secrets"
+pt_reject_deploy "the runner may not patch the Secret" "may not patch Secret example-api-app in dev-example-api: its Role needs patch on Secrets" "$pt_bundle" "$pt_single" app "$bn_declared" "patch:example-api-app"
+pt_reject_deploy "the runner may not get the Secret" "may not get Secret example-api-app in dev-example-api: its Role needs get on Secrets" "$pt_bundle" "$pt_single" app "$bn_declared" "get:example-api-app"
+sec_reset
+FAKE_GET=forbidden pt_reject_deploy "reading the Secret is Forbidden (not treated as a missing Secret)" "may not read Secret example-api-app in dev-example-api (Forbidden)" "$pt_bundle" "$pt_single"
+if grep -q 'does not exist' "$WORK/sec.log" || grep -q ' create ' "$sec_state/calls.log"; then fail "Forbidden was mistaken for NotFound"; else pass "  ... no creation is attempted after Forbidden"; fi
+FAKE_GET=unreachable pt_reject_deploy "the API does not answer (not treated as a missing Secret)" "the Kubernetes API did not answer the request (not a missing Secret" "$pt_bundle" "$pt_single"
+pt_reject_deploy "an undeclared key without pass-through (the input is what opens the Secret)" "app.REDIS_HOST is not declared in requiredSecrets" "$pt_bundle" "$pt_single" ""
 pt_reject_deploy "a planned key of another Secret than the pass-through one" "other.X is not declared in requiredSecrets" "$pt_bundle" "other.X=REDIS_HOST"
 pt_reject_deploy "a pass-through Secret that the values do not declare" "nosuch.X is not declared in requiredSecrets" "$pt_bundle" "nosuch.X=REDIS_HOST" nosuch
-pt_reject_deploy "the runner may not patch the migrate Secret" "may not patch Secret example-api-migrate" "$pt_bundle" "$pt_plan" app "$bn_declared" "patch:example-api-migrate"
-sec_reset example-api-migrate
-pt_reject_deploy "the application Secret does not exist (platform prerequisite)" "Secret example-api-app does not exist in dev-example-api: the platform creates the (empty) object" "$pt_bundle" "$pt_plan"
+pt_reject_deploy "a bundle that is not valid JSON on the deploy side" "does not contain every key planned" '{"DEV_REDIS_HOST": "127.0.0.1"' "$pt_single"
+sec_reset
+if FAKE_CREATE=forbidden pt_provision "$pt_bundle" "$pt_single"; then fail "a Forbidden create was accepted"
+elif grep -qF 'may not create Secret example-api-app in dev-example-api (Forbidden)' "$WORK/sec.log" && [ ! -e "$sec_state/example-api-app.rv" ] && pt_no_leak; then
+  pass "create answered Forbidden by the API: reported as a missing create permission, nothing exists afterwards, no value printed"
+else fail "Forbidden on create"; grep -v '^::add-mask::' "$WORK/sec.log"; fi
+sec_reset example-api-app
+if FAKE_PATCH=forbidden pt_provision "$pt_bundle" "$pt_single"; then fail "a Forbidden patch was accepted"
+elif grep -qF 'may not patch Secret example-api-app in dev-example-api (Forbidden)' "$WORK/sec.log" && pt_no_leak; then
+  pass "patch answered Forbidden by the API: reported as a missing patch permission, no value printed"
+else fail "Forbidden on patch"; grep -v '^::add-mask::' "$WORK/sec.log"; fi
+sec_reset
+if FAKE_CREATE=race pt_provision "$pt_bundle" "$pt_single" && [ "$(cat "$WORK/sec_output")" = "changed=true" ] \
+   && [ "$(sec_data example-api-app REDIS_HOST)" = "127.0.0.1" ] && [ "$(sec_data example-api-app OTHER_WRITER)" = "other" ] && [ ! -e "$sec_state/example-api-app.created" ]; then
+  pass "concurrent creation: AlreadyExists is not an error - the keys are merged into the Secret the other writer created, whose own keys stay"
+else
+  fail "concurrent creation (AlreadyExists)"; grep -v '^::add-mask::' "$WORK/sec.log"
+fi
+# the other two sources keep their contract: they never create a Secret
+sec_reset
+if provision "app.DB_PASSWORD=x" || ! grep -qF 'Secret example-api-app does not exist' "$WORK/sec.log" || grep -q ' create ' "$sec_state/calls.log"; then
+  fail "app-secrets created a Secret or changed its contract"
+else pass "app-secrets is unchanged: a missing Secret is still an error and is never created"; fi
+if provision_bundle "$good_dev" "$bn_good_plan" || ! grep -qF 'does not exist' "$WORK/sec.log" || grep -q ' create ' "$sec_state/calls.log"; then
+  fail "the declared env-bundle created a Secret or changed its contract"
+else pass "the declared env-bundle is unchanged: a missing Secret is still an error and is never created"; fi
+sec_reset example-api-app example-api-migrate
 
 # where the values end up in the containers
 "$HELM" template example-api "$CHART" --namespace dev-example-api -f "$bn_src/deploy/values.yaml" -f "$bn_src/deploy/values-dev.yaml" \
@@ -1188,6 +1286,28 @@ if run_migration "$pt_shadowed" && [ "$(job_env)" = "APP_ENV=dev DB_PORT=5432 DB
   pass "migration Job with a pass-through bundle: env entries the Secret provides are dropped (the Secret is not overridden); DB_USERNAME stays the migration role; the migrate Secret is last"
 else
   fail "migration Job with shadowed names: $(job_env 2>/dev/null)"; cat "$WORK/mig.log"
+fi
+# a service with ONE database user: no migrate Secret, no migration.config - the Job must not keep its own DB_USERNAME
+one="$WORK/one-user"; rm -rf "$one"; mkdir -p "$one"; cp -R "$bn_src/deploy" "$one/"
+yq -i 'del(.requiredSecrets.migrate) | del(.migration.envFromSecrets) | del(.migration.config)' "$one/deploy/values.yaml"; rm -f "$one/deploy/overrides.yaml"
+if pt_check dev "$pt_bundle" app "$one" && [ "$(pt_out shadowed)" = "DB_HOST DB_USERNAME FEATURE_WRITES_ENABLED" ] \
+   && ! grep -q 'migrate\.' <<<"$(pt_out plan)" && grep -q 'app.DB_MIGRATOR_PASSWORD=DB_MIGRATOR_PASSWORD' <<<"$(pt_out plan)"; then
+  pass "single database user: without an alias nothing is planned for a migrate Secret, and DB_USERNAME of the bundle is reported for the migration Job"
+else
+  fail "single-user plan: plan='$(pt_out plan)' shadowed='$(pt_out shadowed)'"; cat "$WORK/bn.log"
+fi
+one_shadowed="$(pt_out shadowed)"
+run_migration_in() {  # directory, shadowed names
+  rm -f "$sec_state/job.json"; echo '{}' >"$WORK/overrides.json"
+  ( cd "$1" && env -i PATH="$migbin:$PATH" HOME="$WORK" RUNNER_TEMP="$WORK" GITHUB_STEP_SUMMARY="$WORK/mig_summary" FAKE_STATE="$sec_state" \
+      GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RELEASE=example-api NAMESPACE=dev-example-api ENVIRONMENT=dev VALUES_DIR=deploy TIMEOUT=10s \
+      DIGEST="$good_digest" CHART_DIR="$OLDPWD/$CHART" SHADOWED="$2" bash --noprofile --norc -c "$mig_step" ) </dev/null >"$WORK/mig.log" 2>&1
+}
+if run_migration_in "$one" "$one_shadowed" && [ "$(job_env)" = "APP_ENV=dev DB_PORT=5432 LOG_CHANNEL=stderr" ] \
+   && [ "$(jq -r '[.spec.template.spec.containers[0].envFrom[].secretRef.name] | join(",")' "$sec_state/job.json")" = "example-api-app" ]; then
+  pass "single database user: the migration Job mounts only the application Secret and keeps no explicit DB_HOST / DB_USERNAME - it connects exactly as the application does"
+else
+  fail "single-user migration Job: $(job_env 2>/dev/null)"; cat "$WORK/mig.log"
 fi
 # shellcheck disable=SC2016  # a literal attempt at injection
 if run_migration 'DB_HOST;$(id)'; then fail "a malformed list of names was accepted by the migration step"; else pass "migration step refuses a malformed list of names"; fi
