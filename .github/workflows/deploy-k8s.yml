@@ -82,9 +82,12 @@ on:
           Pass-through mode of env-bundle: the name of ONE Secret declared in requiredSecrets (for example
           "app"). Every <ENV>_<NAME> entry of the bundle then becomes the key NAME of that Kubernetes Secret,
           with its value unchanged - no declaration per variable, no allow-list, no type check. Only entries
-          renamed by secrets.aliases of <values-dir>/overrides.yaml go elsewhere (the migration password).
-          A NAME that the values files also set under config is removed from the rendered configuration, so
-          the Secret is its only source. Empty (default): the declared mode described at the secret.
+          renamed by secrets.aliases of <values-dir>/overrides.yaml go to another declared Secret. A NAME that
+          the values files also set under config is overridden by the Secret: workloads read the ConfigMap
+          first and the Secret last, and the explicit env entry of that name is dropped from the migration
+          Job. The Secret is created by the deployment itself when it does not exist yet (complete payload,
+          one request); later deployments merge the supplied keys into it and remove no other key.
+          Empty (default): the declared mode described at the secret.
         type: string
         default: ''
     secrets:
@@ -751,11 +754,15 @@ jobs:
       # migration and the upgrade: a missing value or a missing permission stops the deployment with
       # nothing changed. Values travel only through this step's environment and pipes into kubectl's stdin:
       # they are never written to a file, a command line, an output or the summary, and are masked first.
-      # Server-side apply owns exactly the keys supplied in this run; keys written by the platform stay as
-      # they are. The Secret objects are created by the platform, and the runner needs `get` and `patch` on
-      # exactly these names (k8s-infra: ciManagedSecrets) - it is never allowed to create or list Secrets.
       # Two sources, never both: env-bundle (JSON; which keys go where was decided by the validate job from
       # the values files - only names cross between the jobs) or app-secrets (explicit lines).
+      #   app-secrets, declared env-bundle   server-side apply owns exactly the keys supplied in this run; the
+      #                                      Secret object must already exist (the runner needs get + patch)
+      #   pass-through env-bundle            (input env-bundle-secret) the Secret is CREATED with the complete
+      #                                      payload when it does not exist, otherwise the supplied keys are
+      #                                      merged into it: no other key is touched or removed. The runner
+      #                                      needs get + patch, and create for the first deployment.
+      # The runner never lists or deletes Secrets, and every permission is checked before the first write.
       - name: Provision application Secrets
         id: secrets
         env:
@@ -774,7 +781,7 @@ jobs:
             for name in "$@"; do
               for verb in get patch; do
                 kubectl auth can-i "${verb}" "secret/${RELEASE}-${name}" --namespace "${NAMESPACE}" --quiet \
-                  || die "the runner may not ${verb} Secret ${RELEASE}-${name} in ${NAMESPACE}: the platform has to list it in ciManagedSecrets of the namespace (k8s-infra) - nothing was changed"
+                  || die "the runner may not ${verb} Secret ${RELEASE}-${name} in ${NAMESPACE}: its Role needs ${verb} on Secrets of the namespace (k8s-infra) - nothing was changed"
               done
             done
           }
@@ -784,6 +791,56 @@ jobs:
           report_changed() {
             if [ -e "${marker}" ]; then echo "changed=true" >> "${GITHUB_OUTPUT}"; else echo "changed=false" >> "${GITHUB_OUTPUT}"; fi
             rm -f "${marker}"
+          }
+          # Prints the resourceVersion of a Secret. Returns 3 when it does not exist; any other failure
+          # (Forbidden, API unreachable) stops the step - it is never mistaken for "missing".
+          secret_version() {
+            local object="$1" out
+            if out="$(kubectl --namespace "${NAMESPACE}" get secret "${object}" -o jsonpath='{.metadata.resourceVersion}' 2>&1)"; then
+              printf '%s' "${out}"; return 0
+            fi
+            case "${out}" in
+              *NotFound*|*"not found"*) return 3 ;;
+              *Forbidden*|*forbidden*) echo "::error::the runner may not read Secret ${object} in ${NAMESPACE} (Forbidden): its Role needs get on Secrets of the namespace - nothing was changed" >&2; exit 1 ;;
+              *) echo "::error::cannot read Secret ${object} in ${NAMESPACE}: the Kubernetes API did not answer the request (not a missing Secret; the response is not shown) - nothing was changed" >&2; exit 1 ;;
+            esac
+          }
+          # Pass-through: create the Secret with the complete payload, or merge the supplied keys into the
+          # existing one. stdin: the Secret manifest (kept in memory; never in a file or on a command line).
+          sync_secret() {
+            local object="$1" count="$2" manifest before after out rc
+            manifest="$(cat)"
+            [ -n "${manifest}" ] || die "the manifest of Secret ${object} could not be built (nothing was changed)"
+            rc=0; before="$(secret_version "${object}")" || rc=$?
+            if [ "${rc}" = "3" ]; then
+              if out="$(printf '%s' "${manifest}" | kubectl --namespace "${NAMESPACE}" create -f - 2>&1 >/dev/null)"; then
+                rc=0; after="$(secret_version "${object}")" || rc=$?
+                [ "${rc}" = "0" ] || die "Secret ${object} was created in ${NAMESPACE} but cannot be read back"
+                : > "${marker}"
+                echo "Secret ${object}: created with ${count} key(s)"
+                return 0
+              fi
+              case "${out}" in
+                *AlreadyExists*|*"already exists"*) ;;   # created concurrently: update it below
+                *Forbidden*|*forbidden*) die "the runner may not create Secret ${object} in ${NAMESPACE} (Forbidden): its Role needs create on Secrets of the namespace" ;;
+                *) die "creating Secret ${object} in ${NAMESPACE} failed (the response is not shown)" ;;
+              esac
+              rc=0; before="$(secret_version "${object}")" || rc=$?
+              [ "${rc}" = "0" ] || die "Secret ${object} in ${NAMESPACE} exists according to the API but cannot be read"
+            elif [ "${rc}" != "0" ]; then
+              exit 1
+            fi
+            # Merge patch: sets exactly the supplied keys. Keys that are not in this bundle stay as they are.
+            if ! out="$(printf '%s' "${manifest}" | jq -c '{data: .data}' | kubectl --namespace "${NAMESPACE}" patch secret "${object}" --type=merge --patch-file=/dev/stdin 2>&1 >/dev/null)"; then
+              case "${out}" in
+                *Forbidden*|*forbidden*) die "the runner may not patch Secret ${object} in ${NAMESPACE} (Forbidden): its Role needs patch on Secrets of the namespace" ;;
+                *) die "updating Secret ${object} in ${NAMESPACE} failed (the response is not shown)" ;;
+              esac
+            fi
+            rc=0; after="$(secret_version "${object}")" || rc=$?
+            [ "${rc}" = "0" ] || die "Secret ${object} cannot be read after the update"
+            if [ "${before}" != "${after}" ]; then : > "${marker}"; echo "Secret ${object}: updated, ${count} key(s) supplied; other keys untouched"
+            else echo "Secret ${object}: unchanged (${count} key(s) supplied)"; fi
           }
           apply_secret() {
             local object="$1" keys="$2" before after state
@@ -831,6 +888,41 @@ jobs:
               name="${item%%.*}"
               case " ${names} " in *" ${name} "*) ;; *) names="${names} ${name}" ;; esac
             done
+            if [ -n "${BUNDLE_SECRET:-}" ]; then
+              # Pass-through. Every permission and every Secret is examined before the first write.
+              for name in ${names}; do
+                object="${RELEASE}-${name}"
+                for verb in get patch; do
+                  kubectl auth can-i "${verb}" "secret/${object}" --namespace "${NAMESPACE}" --quiet \
+                    || die "the runner may not ${verb} Secret ${object} in ${NAMESPACE}: its Role needs ${verb} on Secrets of the namespace - nothing was changed"
+                done
+                rc=0; secret_version "${object}" >/dev/null || rc=$?
+                if [ "${rc}" = "3" ]; then
+                  kubectl auth can-i create secrets --namespace "${NAMESPACE}" --quiet \
+                    || die "Secret ${object} does not exist in ${NAMESPACE} and the runner may not create it: its Role needs create on Secrets of the namespace (or the platform creates the Secret) - nothing was changed"
+                elif [ "${rc}" != "0" ]; then
+                  exit 1
+                fi
+              done
+              for name in ${names}; do
+                object="${RELEASE}-${name}"
+                count=0
+                for item in ${PLAN}; do
+                  target="${item%%=*}"
+                  if [ "${target%%.*}" = "${name}" ]; then count=$((count + 1)); fi
+                done
+                # shellcheck disable=SC2016  # jq program, not shell
+                printf '%s' "${ENV_BUNDLE}" | jq -c --arg p "${prefix}" --arg plan "${PLAN}" --arg s "${name}" --arg object "${object}" '
+                  . as $b
+                  | { apiVersion: "v1", kind: "Secret", type: "Opaque", metadata: { name: $object },
+                      data: ([ $plan | split(" ")[] | split("=") | select(.[0] | startswith($s + "."))
+                               | { key: (.[0] | ltrimstr($s + ".")), value: ($b[$p + .[1]] | tostring | @base64) } ] | from_entries) }' 2>/dev/null \
+                  | sync_secret "${object}" "${count}"
+              done
+              unset ENV_BUNDLE
+              report_changed
+              exit 0
+            fi
             # shellcheck disable=SC2086  # a list of validated names
             check_access ${names}
             for name in ${names}; do
