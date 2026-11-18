@@ -8,6 +8,8 @@ name: Deploy to Kubernetes
 #   deployment.namespace        target namespace - every helm and kubectl command uses exactly this one
 #   deployment.release          Helm release name; Kubernetes objects and Secrets are named <release>-...
 #   deployment.envBundle.secret optional: the Secret (a name of requiredSecrets) that env-bundle fills
+#   deployment.migrationWaitTimeoutSeconds  optional: how long the migration Job is watched (image pull included)
+#   deployment.rolloutTimeoutSeconds        optional: timeout of `helm upgrade --wait` (default: input timeout)
 #   image.repository            the image; the digest comes from the build of the same run
 # The `deployment` block is read here and removed before the values reach Helm. Nothing is derived from the
 # repository name, and nothing falls back to the runner's namespace or a kubeconfig context.
@@ -137,6 +139,10 @@ env:
   RUNNER_LABEL: akjet-ds-apps
   # Helm release label that records which repository a release belongs to (release records only).
   OWNER_LABEL: akjet.kz/source-repository
+  # Budget of the deploy job in seconds; equals its timeout-minutes (120) - keep both in step. The migration
+  # wait plus the rollout timeout plus DEPLOY_OVERHEAD_SECONDS must fit into it (checked by the validate job).
+  DEPLOY_JOB_SECONDS: '7200'
+  DEPLOY_OVERHEAD_SECONDS: '900'
   DEV_DEPLOY_BRANCH: dev-k8s/release
 
 jobs:
@@ -152,6 +158,8 @@ jobs:
       namespace: ${{ steps.identity.outputs.namespace }}
       release: ${{ steps.identity.outputs.release }}
       bundle-secret: ${{ steps.identity.outputs.bundle-secret }}
+      migration-wait: ${{ steps.render.outputs.migration-wait }}
+      rollout-timeout: ${{ steps.identity.outputs.rollout-timeout }}
       runner: ${{ steps.target.outputs.runner }}
       chart: ${{ steps.target.outputs.chart }}
       digest: ${{ steps.target.outputs.digest }}
@@ -257,6 +265,7 @@ jobs:
           VALUES_DIR: ${{ inputs.values-dir }}
           RELEASE_INPUT: ${{ inputs.release }}
           BUNDLE_SECRET_INPUT: ${{ inputs.env-bundle-secret }}
+          TIMEOUT: ${{ inputs.timeout }}
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
@@ -267,8 +276,8 @@ jobs:
           # shellcheck disable=SC2016  # yq / jq programs, not shell
           meta="$(yq ea -o=json -I0 '. as $doc ireduce ({}; . * $doc) | .deployment // {}' "${common}" "${envfile}")"
           printf '%s' "${meta}" | jq -e 'type == "object"' >/dev/null 2>&1 || die "deployment in ${VALUES_DIR}/values*.yaml must be a map"
-          extra="$(printf '%s' "${meta}" | jq -r '(keys - ["namespace", "release", "envBundle"]) | join(", ")')"
-          [ -z "${extra}" ] || die "deployment: unknown key(s) ${extra} in ${VALUES_DIR}/values*.yaml (allowed: namespace, release, envBundle)"
+          extra="$(printf '%s' "${meta}" | jq -r '(keys - ["namespace", "release", "envBundle", "migrationWaitTimeoutSeconds", "rolloutTimeoutSeconds"]) | join(", ")')"
+          [ -z "${extra}" ] || die "deployment: unknown key(s) ${extra} in ${VALUES_DIR}/values*.yaml (allowed: namespace, release, envBundle, migrationWaitTimeoutSeconds, rolloutTimeoutSeconds)"
           extra="$(printf '%s' "${meta}" | jq -r '(.envBundle // {}) | if type == "object" then (keys - ["secret"]) | join(", ") else "(not a map)" end')"
           [ -z "${extra}" ] || die "deployment.envBundle: unknown key(s) ${extra} (allowed: secret)"
           printf '%s' "${meta}" | jq -e '[.namespace, .release, (.envBundle // {}).secret] | all(. == null or type == "string")' >/dev/null \
@@ -303,6 +312,20 @@ jobs:
             printf '%s' "${bundle_secret}" | grep -Eq "${label}" || die "deployment.envBundle.secret '${bundle_secret}' is not a Secret name of requiredSecrets"
           fi
 
+          # Optional timeouts, whole seconds within a fixed range (the deploy job has a fixed budget).
+          seconds_of() {  # key min max -> value or "" when absent
+            printf '%s' "${meta}" | jq -r --arg k "$1" --argjson lo "$2" --argjson hi "$3" '
+              .[$k] | if . == null then ""
+                      elif type == "number" and . == floor and . >= $lo and . <= $hi then tostring
+                      else error("bad") end' 2>/dev/null \
+              || { echo "::error::deployment.$1 must be a whole number of seconds between $2 and $3" >&2; return 1; }
+          }
+          migration_wait="$(seconds_of migrationWaitTimeoutSeconds 60 5400)" || exit 1
+          rollout_timeout="$(seconds_of rolloutTimeoutSeconds 60 3600)" || exit 1
+          if [ -z "${rollout_timeout}" ]; then
+            rollout_timeout="${TIMEOUT%[sm]}"; case "${TIMEOUT}" in *m) rollout_timeout=$((rollout_timeout * 60)) ;; esac
+          fi
+
           # The chart does not know `deployment`: Helm gets copies of the two files without it.
           mkdir -p "${RUNNER_TEMP}/values"
           yq 'del(.deployment)' "${common}" > "${RUNNER_TEMP}/values/values.yaml"
@@ -311,6 +334,8 @@ jobs:
             echo "namespace=${namespace}"
             echo "release=${release}"
             echo "bundle-secret=${bundle_secret}"
+            echo "migration-wait=${migration_wait}"
+            echo "rollout-timeout=${rollout_timeout}"
           } >> "${GITHUB_OUTPUT}"
           echo "Deployment from ${VALUES_DIR}: release ${release} in namespace ${namespace}${bundle_secret:+; env-bundle -> Secret ${release}-${bundle_secret}}"
 
@@ -612,7 +637,10 @@ jobs:
           echo "${bin}" >> "${GITHUB_PATH}"
 
       - name: Render
+        id: render
         env:
+          MIGRATION_WAIT: ${{ steps.identity.outputs.migration-wait }}
+          ROLLOUT_TIMEOUT: ${{ steps.identity.outputs.rollout-timeout }}
           ENVIRONMENT: ${{ inputs.environment }}
           DIGEST: ${{ steps.target.outputs.digest }}
           CHART_VERSION: ${{ inputs.chart-version }}
@@ -663,6 +691,25 @@ jobs:
               || { echo "::error::run-migrations is set, but the values do not enable 'migration'"; exit 1; }
             cat "${RUNNER_TEMP}/migration.yaml" >> "${RUNNER_TEMP}/all.yaml"
           fi
+          # How long the deploy job watches the migration Job. The Job's own activeDeadlineSeconds (Kubernetes,
+          # counted from the Job start, image pull included) must end before the watch does: Kubernetes then
+          # stops the Job itself, and no migration can run on unobserved after this workflow gave up.
+          wait=0
+          if [ "${RUN_MIGRATIONS}" = "true" ]; then
+            deadline="$(yq '.spec.activeDeadlineSeconds // ""' "${RUNNER_TEMP}/migration.yaml")"
+            case "${deadline}" in
+              ''|*[!0-9]*) echo "::error::the migration Job has no activeDeadlineSeconds (migration.activeDeadlineSeconds of the values)"; exit 1 ;;
+            esac
+            wait="${MIGRATION_WAIT:-$((deadline + 120))}"
+            if [ $((deadline + 60)) -gt "${wait}" ]; then
+              echo "::error::migration.activeDeadlineSeconds (${deadline}) must end at least 60 s before deployment.migrationWaitTimeoutSeconds (${wait}): otherwise the Job could keep running after the workflow stopped watching it"; exit 1
+            fi
+            echo "Migration Job: Kubernetes deadline ${deadline} s, watched for up to ${wait} s"
+          fi
+          if [ $((wait + ROLLOUT_TIMEOUT + DEPLOY_OVERHEAD_SECONDS)) -gt "${DEPLOY_JOB_SECONDS}" ]; then
+            echo "::error::migration wait (${wait} s) + rollout timeout (${ROLLOUT_TIMEOUT} s) + ${DEPLOY_OVERHEAD_SECONDS} s exceed the deploy job budget of ${DEPLOY_JOB_SECONDS} s"; exit 1
+          fi
+          echo "migration-wait=${wait}" >> "${GITHUB_OUTPUT}"
 
       - name: Validate manifests
         run: |
@@ -704,14 +751,18 @@ jobs:
     # It is available to every repository in the runner group; what the job can change is limited by
     # the RBAC of its ServiceAccount (namespaced Role in enabled application namespaces only).
     runs-on: ${{ needs.validate.outputs.runner }}
-    timeout-minutes: 45
+    # = env.DEPLOY_JOB_SECONDS / 60. Covers the longest allowed migration wait (90 min) together with the
+    # rollout timeout and the other steps; the validate job checks the sum for the actual values.
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: read
 
-    # One Helm operation per release at a time; a running deployment is never cancelled.
+    # One deployment (and therefore one migration) per target at a time; a running one is never cancelled.
+    # The key is the resolved target. GitHub scopes concurrency groups to the repository; across repositories
+    # the release owner check and the running-migration check of the migration step apply.
     concurrency:
-      group: deploy-k8s-${{ github.repository }}-dev-${{ needs.validate.outputs.release }}
+      group: deploy-k8s-dev-${{ needs.validate.outputs.namespace }}-${{ needs.validate.outputs.release }}
       cancel-in-progress: false
 
     env:
@@ -726,6 +777,7 @@ jobs:
       NAMESPACE: ${{ needs.validate.outputs.namespace }}
       RELEASE: ${{ needs.validate.outputs.release }}
       CHART: ${{ needs.validate.outputs.chart }}
+      ROLLOUT_TIMEOUT: ${{ needs.validate.outputs.rollout-timeout }}
 
     steps:
       - name: Checkout
@@ -1093,13 +1145,17 @@ jobs:
           done
           report_changed
 
-      # The migration Job is created before the upgrade and is not part of the Helm release.
-      # A failed migration stops the deployment; the schema is never rolled back automatically.
+      # The migration Job is created before the upgrade and is not part of the Helm release. This step is
+      # green only when Kubernetes reports the Job Complete=True; then the upgrade follows with the same
+      # digest. A failed, vanished or unfinished Job stops the deployment (the upgrade does not run); the
+      # schema is never rolled back automatically. Waiting includes the image pull: the limit is the resolved
+      # migration wait (deployment.migrationWaitTimeoutSeconds), never the Helm timeout.
       - name: Run the migration Job
         if: inputs.run-migrations
         env:
           CHART_DIR: ${{ steps.chart.outputs.dir }}
           SHADOWED: ${{ needs.validate.outputs.bundle-shadowed }}
+          MIGRATION_WAIT: ${{ needs.validate.outputs.migration-wait }}
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
@@ -1128,6 +1184,20 @@ jobs:
             "Job ${job} -"|"Job ${job} ${NAMESPACE}") ;;
             *) die "the rendered migration object is '${got}', expected Job ${job} in ${NAMESPACE} - nothing was created" ;;
           esac
+          # Never two migrations of one release at a time: a Job of an earlier run that has not finished (for
+          # example one that outlived a cancelled workflow) blocks a new one. Suspended Jobs are finished.
+          selector="app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=migration"
+          if ! existing="$(kubectl --namespace "${NAMESPACE}" get jobs -l "${selector}" -o json 2>&1)"; then
+            case "${existing}" in
+              *Forbidden*|*forbidden*) die "the runner may not list Jobs in ${NAMESPACE} - nothing was created" ;;
+              *) die "cannot list the migration Jobs of ${RELEASE} in ${NAMESPACE} (the response is not shown) - nothing was created" ;;
+            esac
+          fi
+          # shellcheck disable=SC2016  # jq program, not shell
+          unfinished="$(printf '%s' "${existing}" | jq -r '[.items[] | select([.status.conditions[]? | select((.type == "Complete" or .type == "Failed" or .type == "Suspended") and .status == "True")] | length == 0) | .metadata.name] | join(" ")')"
+          if [ -n "${unfinished}" ]; then
+            die "migration Job(s) ${unfinished} of ${RELEASE} in ${NAMESPACE} have not finished; a second migration is not started (nothing was created)"
+          fi
           # The target namespace is written into the object itself, so the object and the request agree.
           # shellcheck disable=SC2016  # jq program, not shell
           printf '%s' "${objects}" \
@@ -1137,22 +1207,146 @@ jobs:
                 | .spec.template.spec.containers |= map(if .env then .env |= map(select(.name as $n | ($drop | index($n)) | not)) else . end)' \
             | kubectl --namespace "${NAMESPACE}" create -f -
 
-          seconds="${TIMEOUT%[sm]}"; case "${TIMEOUT}" in *m) seconds=$((seconds * 60)) ;; esac
-          deadline=$(( $(date +%s) + seconds ))
-          result=timeout
-          while [ "$(date +%s)" -lt "${deadline}" ]; do
-            status="$(kubectl --namespace "${NAMESPACE}" get job "${job}" \
-              -o jsonpath='{.status.succeeded}/{.status.failed}')"
-            case "${status}" in
-              1/*) result=succeeded; break ;;
-              */[1-9]*) result=failed; break ;;
+          # ---- watch the Job until Kubernetes reports it Complete or Failed
+          poll="${MIGRATION_POLL_SECONDS:-10}"
+          report_every=60
+          api_retries=6                      # consecutive transient API errors tolerated (about one minute)
+          started="$(date +%s)"; deadline=$((started + MIGRATION_WAIT)); grace_used=false
+          api_failures=0; last_report=-${report_every}; last_line=""; line=""; warned=" "; container_started=false
+          job_json=""; result=""; reason=""
+          fetch_job() {  # 0 = job_json set, 3 = NotFound, 4 = transient; Forbidden / Unauthorized stop at once
+            local out
+            if out="$(kubectl --namespace "${NAMESPACE}" get job "${job}" -o json 2>&1)"; then job_json="${out}"; return 0; fi
+            case "${out}" in
+              *NotFound*|*"not found"*) return 3 ;;
+              *Forbidden*|*forbidden*|*Unauthorized*|*unauthorized*)
+                die "the runner may not read Job ${job} in ${NAMESPACE} (Forbidden / Unauthorized): the state of the migration is unknown - inspect the Job before deploying again" ;;
+              *) return 4 ;;
             esac
-            sleep 5
+          }
+          condition() { printf '%s' "${job_json}" | jq -r --arg t "$1" '[.status.conditions[]? | select(.type == $t and .status == "True")][0] | if . == null then "" else (.reason // $t) end'; }
+          # Sets `line` to one line about the pod (phase, container state), records whether the container has
+          # started and warns once per image / start problem. Never prints the pod spec or its environment.
+          # Called directly (not in $(...)) so that its state survives.
+          pod_observe() {
+            local pods
+            if ! pods="$(kubectl --namespace "${NAMESPACE}" get pods -l "job-name=${job}" -o json 2>/dev/null)"; then
+              line="pod status unavailable"; return 0
+            fi
+            line="$(printf '%s' "${pods}" | jq -r '
+              if (.items | length) == 0 then "no pod yet"
+              else .items[-1] as $p | ($p.status.containerStatuses // [])[0] as $c
+                | "pod \($p.metadata.name) \($p.status.phase // "Unknown")"
+                + (if $c == null then (if $p.status.phase == "Pending" then ", scheduling / pulling the image" else "" end)
+                   elif $c.state.waiting then ", container waiting: \($c.state.waiting.reason // "?")"
+                     + (if ($c.state.waiting.reason // "") == "ContainerCreating" then " (image pull or container start in progress)" else "" end)
+                   elif $c.state.running then ", container running since \($c.state.running.startedAt)"
+                   elif $c.state.terminated then ", container terminated: \($c.state.terminated.reason // "?") exit \($c.state.terminated.exitCode)"
+                   else "" end) end')"
+            printf '%s' "${pods}" | jq -e '[.items[].status.containerStatuses[]? | select(.state.running or .state.terminated)] | length > 0' >/dev/null 2>&1 \
+              && container_started=true
+            for problem in $(printf '%s' "${pods}" | jq -r '[.items[].status.containerStatuses[]?.state.waiting.reason // empty
+                                                              | select(test("ErrImagePull|ImagePullBackOff|InvalidImageName|CreateContainerConfigError|CreateContainerError"))] | unique | .[]'); do
+              case "${warned}" in *" ${problem} "*) ;; *)
+                warned="${warned}${problem} "
+                echo "::warning::migration Job ${job}: container waiting with ${problem} - Kubernetes keeps retrying until the Job deadline; see the events below if it fails" ;;
+              esac
+            done
+            return 0
+          }
+          diagnose() {  # names, phases, reasons and events only - no environment, no Secret
+            echo "--- Job ${job} in ${NAMESPACE}"
+            if [ -n "${job_json}" ]; then
+              printf '%s' "${job_json}" | jq -r '"active=\(.status.active // 0) succeeded=\(.status.succeeded // 0) failed=\(.status.failed // 0)",
+                (.status.conditions[]? | "condition \(.type)=\(.status) \(.reason // "") \(.message // "")")'
+            fi
+            pod_observe; echo "--- pod: ${line}"
+            echo "--- events"
+            kubectl --namespace "${NAMESPACE}" get events --field-selector "involvedObject.name=${job}" \
+              -o custom-columns='TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message' 2>/dev/null | tail -10 || echo "events unavailable"
+            for pod in $(kubectl --namespace "${NAMESPACE}" get pods -l "job-name=${job}" -o name 2>/dev/null); do
+              kubectl --namespace "${NAMESPACE}" get events --field-selector "involvedObject.name=${pod#pod/}" \
+                -o custom-columns='TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message' 2>/dev/null | tail -15 || echo "events of ${pod} unavailable"
+            done
+          }
+          print_logs() {  # only once the container has started; a missing log never hides the real result
+            if [ "${container_started}" = "true" ]; then
+              echo "--- migration output (last 200 lines)"
+              if ! kubectl --namespace "${NAMESPACE}" logs "job/${job}" --tail=200; then echo "(the log of ${job} is not available)"; fi
+            else
+              echo "--- no migration output: the container never started"
+            fi
+          }
+
+          echo "Watching Job ${job} in ${NAMESPACE} for up to ${MIGRATION_WAIT} s (image pull included), every ${poll} s"
+          while :; do
+            rc=0; fetch_job || rc=$?
+            if [ "${rc}" = "0" ]; then
+              api_failures=0
+              if [ -n "$(condition Complete)" ]; then result=succeeded; break; fi
+              failed="$(condition Failed)"
+              if [ -n "${failed}" ]; then result=failed; reason="${failed}"; break; fi
+            elif [ "${rc}" = "3" ]; then
+              result=vanished; break
+            else
+              api_failures=$((api_failures + 1))
+              echo "Kubernetes API did not answer (${api_failures}/${api_retries})"
+              if [ "${api_failures}" -ge "${api_retries}" ]; then result=unreachable; break; fi
+            fi
+            now="$(date +%s)"
+            if [ "${now}" -ge "${deadline}" ]; then
+              # A Job whose pod succeeded may report Complete a little later: one short extension.
+              if [ "${grace_used}" = "false" ] && [ "$(printf '%s' "${job_json}" | jq -r '.status.succeeded // 0')" -ge 1 ] 2>/dev/null; then
+                grace_used=true; deadline=$((deadline + 60)); echo "the pod succeeded; waiting up to 60 s for the Job to report Complete"
+              else
+                result=timeout; break
+              fi
+            fi
+            elapsed=$((now - started))
+            pod_observe
+            if [ $((elapsed - last_report)) -ge "${report_every}" ] || [ "${line}" != "${last_line}" ]; then
+              printf '[%02d:%02d] %s: active=%s succeeded=%s failed=%s; %s\n' $((elapsed / 60)) $((elapsed % 60)) "${job}" \
+                "$(printf '%s' "${job_json}" | jq -r '.status.active // 0')" "$(printf '%s' "${job_json}" | jq -r '.status.succeeded // 0')" \
+                "$(printf '%s' "${job_json}" | jq -r '.status.failed // 0')" "${line}"
+              last_report="${elapsed}"; last_line="${line}"
+            fi
+            sleep "${poll}"
           done
-          echo "--- migration output (last 200 lines)"
-          kubectl --namespace "${NAMESPACE}" logs "job/${job}" --tail=200 || true
+          if [ "${result}" = "timeout" ]; then
+            # Last look: a Job that completed right at the deadline is not a failure.
+            rc=0; fetch_job || rc=$?
+            if [ "${rc}" = "0" ] && [ -n "$(condition Complete)" ]; then result=succeeded
+            elif [ "${rc}" = "0" ] && [ -n "$(condition Failed)" ]; then result=failed; reason="$(condition Failed)"; fi
+          fi
+          elapsed=$(( $(date +%s) - started ))
+          pod_observe
+
+          if [ "${result}" = "succeeded" ]; then
+            print_logs
+            echo "Migration Job ${job} in ${NAMESPACE}: Complete=True after ${elapsed} s - continuing with the upgrade"
+            echo "### Migration Job \`${job}\`: succeeded (${elapsed} s, image pull included)" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          diagnose
+          print_logs
+          case "${result}" in
+            failed)
+              message="migration Job ${job} failed (${reason}); the upgrade does not run" ;;
+            vanished)
+              message="migration Job ${job} disappeared from ${NAMESPACE} before it finished; the state of the database is unknown and the upgrade does not run" ;;
+            unreachable)
+              message="the Kubernetes API did not answer ${api_retries} times in a row while Job ${job} was running; its outcome is unknown - inspect it before deploying again" ;;
+            timeout)
+              if [ "${container_started}" = "true" ]; then
+                message="migration Job ${job} has not finished after ${elapsed} s and its container has started: the migration may still be changing the database. It is NOT stopped by this workflow (Kubernetes stops it at its activeDeadlineSeconds); reconcile before deploying again"
+              elif kubectl --namespace "${NAMESPACE}" patch job "${job}" --type=merge -p '{"spec":{"suspend":true}}' >/dev/null 2>&1; then
+                message="migration Job ${job} did not start its container within ${elapsed} s; it was suspended so that it cannot start later (the Job object is kept for inspection)"
+              else
+                message="migration Job ${job} did not start its container within ${elapsed} s and could not be suspended; it may still start later - delete or inspect it"
+              fi ;;
+          esac
           echo "### Migration Job \`${job}\`: ${result}" >> "${GITHUB_STEP_SUMMARY}"
-          [ "${result}" = "succeeded" ] || { echo "::error::migration Job ${job}: ${result}"; exit 1; }
+          die "${message}"
 
       - name: Helm upgrade
         env:
@@ -1171,7 +1365,7 @@ jobs:
             --labels "${OWNER_LABEL_VALUE}"
             --set-string "image.digest=${DIGEST}"
             --set migration.render=false
-            --rollback-on-failure --wait --timeout "${TIMEOUT}" --history-max 20
+            --rollback-on-failure --wait --timeout "${ROLLOUT_TIMEOUT}s" --history-max 20
             --description "commit ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
           )
           if [ "${RESTART}" = "true" ] || [ "${SECRETS_CHANGED}" = "true" ]; then

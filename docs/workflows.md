@@ -65,7 +65,7 @@ Trivy сканирует каждый образ до публикации: вс
 | `chart` | `oci://ghcr.io/<владелец>/charts/akjet-app` | либо `./путь` к чарту в репозитории сервиса |
 | `run-migrations` | `false` | запустить Job миграций до обновления |
 | `restart` | `false` | перезапустить pod'ы (после изменения Secret) |
-| `timeout` | `10m` | таймаут обновления и миграции |
+| `timeout` | `10m` | таймаут `helm upgrade --wait`, если в values нет `deployment.rolloutTimeoutSeconds`; на ожидание миграции не влияет |
 | `pod-logs-on-failure` | `false` | печатать хвост логов pod'ов при сбое |
 
 Секретов workflow не принимает.
@@ -138,6 +138,8 @@ deployment:
 | `deployment.namespace` | да | имя неймспейса Kubernetes, начинается с `<окружение>-` (DEV не может указать неймспейс STAGE и наоборот) |
 | `deployment.release` | да | `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, не длиннее 40 символов |
 | `deployment.envBundle.secret` | нет | имя из `requiredSecrets`; включает сквозной режим `env-bundle` |
+| `deployment.migrationWaitTimeoutSeconds` | нет | целое 60–5400: сколько секунд следить за Job миграций (скачивание образа входит). По умолчанию `migration.activeDeadlineSeconds` + 120 |
+| `deployment.rolloutTimeoutSeconds` | нет | целое 60–3600: таймаут `helm upgrade --wait`. По умолчанию — input `timeout` |
 | `image.repository` | да | образ под `ghcr.io/<владелец>/`, без тега и digest |
 
 Других ключей в `deployment` нет: опечатка останавливает запуск. Блок `deployment` workflow читает сам и
@@ -299,12 +301,27 @@ Job миграций подключает тот же Secret, что и workload
 2. **Проверка раннера**: job идёт внутри кластера под ServiceAccount'ом pod'а, kubeconfig отсутствует.
 3. **Секреты приложения** (если передан `app-secrets`): проверка значений и прав, затем запись.
 4. **Миграции** (при `run-migrations`): Job создаётся до обновления; сбой останавливает деплой.
+   - Если у релиза есть незавершённый Job миграций (метки `app.kubernetes.io/instance` +
+     `app.kubernetes.io/component=migration`, нет условия Complete/Failed/Suspended), второй не создаётся.
+   - Job опрашивается каждые 10 с до `deployment.migrationWaitTimeoutSeconds`. Успех — только условие
+     `Complete=True` Job'а; `Failed=True` — сбой с причиной. Работающий pod успехом не считается,
+     `ContainerCreating` — ожидание (скачивание образа), `ImagePullBackOff` и подобные — предупреждение один
+     раз. Раз в минуту печатается строка прогресса (счётчики Job'а, фаза pod'а, состояние контейнера).
+   - Временные ошибки API повторяются до 6 раз подряд; Forbidden/Unauthorized и исчезновение Job'а — сбой.
+   - При сбое печатаются условия Job'а, состояние pod'а и контейнера, события; лог — только если контейнер
+     запускался. Переменные окружения не печатаются.
+   - Истекло ожидание, а контейнер не стартовал — Job приостанавливается (`suspend`), не удаляется.
+     Контейнер стартовал — Job не трогается (миграция может идти); его остановит Kubernetes по
+     `migration.activeDeadlineSeconds`.
+   - Проверка values: `migration.activeDeadlineSeconds` (считается от старта Job'а, скачивание образа
+     входит) должен заканчиваться минимум за 60 с до конца ожидания, чтобы Job всегда завершался под
+     наблюдением; ожидание + rollout + 900 с не должны превышать 7200 с — `timeout-minutes: 120` job'а деплоя.
 5. **Обновление**: `helm upgrade --install --rollback-on-failure --wait`, `HELM_DRIVER=configmap`.
 6. **Проверка rollout** всех Deployment'ов релиза.
 7. **Диагностика при сбое**: история релиза, состояние workload'ов и контейнеров, события. Содержимое
    Secret'ов, спецификации pod'ов и переменные окружения не печатаются.
 
-Одновременно выполняется один деплой на релиз; идущий деплой не отменяется.
+Одновременно выполняется один деплой на цель (неймспейс + релиз из values); идущий деплой не отменяется.
 
 ### Откат
 
