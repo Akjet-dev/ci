@@ -3,10 +3,15 @@ name: Deploy to Kubernetes
 # Reusable workflow: validates the rendered manifests on a GitHub-hosted runner, then runs
 # `helm upgrade --install` from a self-hosted runner INSIDE the target cluster.
 #
-#   namespace = <environment>-<repository name>   computed here, never an input. Repositories that the platform
-#               places together share <environment>-<group>; the groups are fixed in this file (step
-#               "Resolve and check the target") and mirror k8s-infra namespaces/*.yaml
-#   runner    = akjet-ds-apps                     fixed in this file (env RUNNER_LABEL), never an input
+# This workflow does not know which service it deploys. WHAT and WHERE come from the values files of the
+# calling repository (<values-dir>/values.yaml, then values-<environment>.yaml):
+#   deployment.namespace        target namespace - every helm and kubectl command uses exactly this one
+#   deployment.release          Helm release name; Kubernetes objects and Secrets are named <release>-...
+#   deployment.envBundle.secret optional: the Secret (a name of requiredSecrets) that env-bundle fills
+#   image.repository            the image; the digest comes from the build of the same run
+# The `deployment` block is read here and removed before the values reach Helm. Nothing is derived from the
+# repository name, and nothing falls back to the runner's namespace or a kubeconfig context.
+#   runner    = akjet-ds-apps                     the generic in-cluster runner (env RUNNER_LABEL), never an input
 #
 # What may be deployed from where is fixed in this file (step "Resolve and check the target"):
 #   dev    validation from any branch; deployment only from the branch dev-k8s/release, and only while
@@ -48,7 +53,9 @@ on:
         type: string
         required: true
       release:
-        description: Helm release name (default - the repository name)
+        description: >-
+          Deprecated - the release is declared in the values (deployment.release). When set, it must equal
+          the declared release; it never replaces it.
         type: string
         default: ''
       values-dir:
@@ -79,8 +86,9 @@ on:
         default: false
       env-bundle-secret:
         description: >-
-          Pass-through mode of env-bundle: the name of ONE Secret declared in requiredSecrets (for example
-          "app"). Every <ENV>_<NAME> entry of the bundle then becomes the key NAME of that Kubernetes Secret,
+          Deprecated - declare deployment.envBundle.secret in the values instead (when both are set they must
+          be equal). Pass-through mode of env-bundle: the name of ONE Secret declared in requiredSecrets (for
+          example "app"). Every <ENV>_<NAME> entry of the bundle then becomes the key NAME of that Kubernetes Secret,
           with its value unchanged - no declaration per variable, no allow-list, no type check. Only entries
           renamed by secrets.aliases of <values-dir>/overrides.yaml go to another declared Secret. A NAME that
           the values files also set under config is overridden by the Secret: workloads read the ConfigMap
@@ -120,11 +128,15 @@ env:
   HELM_SHA256: 0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
   KUBECTL_VERSION: '1.35.10'
   KUBECTL_SHA256: c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
+  YQ_VERSION: '4.54.1'
+  YQ_SHA256: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
   KUBECONFORM_VERSION: '0.8.0'
   KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
   KUBERNETES_VERSION: '1.35.6'
   # Fixed parts of the contract with the platform; deliberately not inputs.
   RUNNER_LABEL: akjet-ds-apps
+  # Helm release label that records which repository a release belongs to (release records only).
+  OWNER_LABEL: akjet.kz/source-repository
   DEV_DEPLOY_BRANCH: dev-k8s/release
 
 jobs:
@@ -137,8 +149,9 @@ jobs:
       contents: read
       packages: read
     outputs:
-      namespace: ${{ steps.target.outputs.namespace }}
-      release: ${{ steps.target.outputs.release }}
+      namespace: ${{ steps.identity.outputs.namespace }}
+      release: ${{ steps.identity.outputs.release }}
+      bundle-secret: ${{ steps.identity.outputs.bundle-secret }}
       runner: ${{ steps.target.outputs.runner }}
       chart: ${{ steps.target.outputs.chart }}
       digest: ${{ steps.target.outputs.digest }}
@@ -154,7 +167,6 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           DIGEST: ${{ inputs.image-digest }}
           CHART_VERSION: ${{ inputs.chart-version }}
-          RELEASE_INPUT: ${{ inputs.release }}
           VALUES_DIR: ${{ inputs.values-dir }}
           CHART_INPUT: ${{ inputs.chart }}
           TIMEOUT: ${{ inputs.timeout }}
@@ -166,10 +178,10 @@ jobs:
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
-          label='^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
 
           # Explicit allow-list of what this workflow may do. It is changed here, in review, never by
-          # callers: there is no input for the namespace, the runner or the deployment branch.
+          # callers: there is no input for the runner or the deployment branch. The namespace and the
+          # release come from the values of the caller (step "Resolve the deployment from values").
           deploy=false
           case "${ENVIRONMENT}" in
             dev)
@@ -187,30 +199,6 @@ jobs:
                 || die "this workflow only validates the stage configuration; stage is deployed by the platform-controlled dispatcher" ;;
             *) die "environment '${ENVIRONMENT}' is not known to this workflow" ;;
           esac
-
-          service="${GITHUB_REPOSITORY#*/}"
-          printf '%s' "${service}" | grep -Eq "${label}" \
-            || die "repository name '${service}' cannot be used as a namespace suffix (lower case letters, digits, '-')"
-          # Repositories the platform places in one namespace (k8s-infra namespaces/*.yaml). Every other
-          # repository has its own namespace. Changed here, in review, together with the platform registry.
-          case "${service}" in
-            backend|lk-frontend) group="lk-backend" ;;
-            *) group="${service}" ;;
-          esac
-          namespace="${ENVIRONMENT}-${group}"
-          [ "${#namespace}" -le 63 ] || die "namespace '${namespace}' is longer than 63 characters"
-
-          release="${RELEASE_INPUT:-${service}}"
-          printf '%s' "${release}" | grep -Eq "${label}" || die "release must match ${label}"
-          [ "${#release}" -le 40 ] || die "release is longer than 40 characters"
-          if [ "${group}" != "${service}" ]; then
-            # Shared namespace: a repository may only manage releases named after itself, so it can never
-            # upgrade, roll back or replace the release of the other repository.
-            case "${release}" in
-              "${service}"|"${service}"-*) ;;
-              *) die "namespace ${namespace} is shared: the release of ${service} must be '${service}' or start with '${service}-'" ;;
-            esac
-          fi
 
           if [ "${APP_SECRETS_SUPPLIED:-false}" = "true" ] && [ "${deploy}" != "true" ]; then
             die "app-secrets may be passed only to the job that deploys to dev; validation never receives secret values"
@@ -244,8 +232,6 @@ jobs:
           esac
 
           {
-            echo "namespace=${namespace}"
-            echo "release=${release}"
             echo "runner=${RUNNER_LABEL}"
             echo "chart=${chart}"
             echo "digest=${DIGEST}"
@@ -260,6 +246,73 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # WHAT and WHERE, from the values of the caller only. Fails before anything else when the namespace or
+      # the release is missing or invalid: there is no default, no derivation from the repository name and no
+      # fallback to the runner's namespace. The values handed to Helm later are copies without `deployment`.
+      - name: Resolve the deployment from values
+        id: identity
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          VALUES_DIR: ${{ inputs.values-dir }}
+          RELEASE_INPUT: ${{ inputs.release }}
+          BUNDLE_SECRET_INPUT: ${{ inputs.env-bundle-secret }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$1"; exit 1; }
+          label='^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+          common="${VALUES_DIR}/values.yaml"; envfile="${VALUES_DIR}/values-${ENVIRONMENT}.yaml"
+          for f in "${common}" "${envfile}"; do test -f "${f}" || die "values file not found: ${f}"; done
+          # Same precedence as Helm: values.yaml, then values-<environment>.yaml.
+          # shellcheck disable=SC2016  # yq / jq programs, not shell
+          meta="$(yq ea -o=json -I0 '. as $doc ireduce ({}; . * $doc) | .deployment // {}' "${common}" "${envfile}")"
+          printf '%s' "${meta}" | jq -e 'type == "object"' >/dev/null 2>&1 || die "deployment in ${VALUES_DIR}/values*.yaml must be a map"
+          extra="$(printf '%s' "${meta}" | jq -r '(keys - ["namespace", "release", "envBundle"]) | join(", ")')"
+          [ -z "${extra}" ] || die "deployment: unknown key(s) ${extra} in ${VALUES_DIR}/values*.yaml (allowed: namespace, release, envBundle)"
+          extra="$(printf '%s' "${meta}" | jq -r '(.envBundle // {}) | if type == "object" then (keys - ["secret"]) | join(", ") else "(not a map)" end')"
+          [ -z "${extra}" ] || die "deployment.envBundle: unknown key(s) ${extra} (allowed: secret)"
+          printf '%s' "${meta}" | jq -e '[.namespace, .release, (.envBundle // {}).secret] | all(. == null or type == "string")' >/dev/null \
+            || die "deployment.namespace, deployment.release and deployment.envBundle.secret must be strings"
+          field() { printf '%s' "${meta}" | jq -r --arg p "$1" 'getpath($p | split(".")) // ""'; }   # dotted path -> value, "" when absent
+          namespace="$(field namespace)"; release="$(field release)"; bundle_secret="$(field envBundle.secret)"
+
+          [ -n "${namespace}" ] || die "deployment.namespace is not set in ${common} or ${envfile}: the target namespace comes only from the values of the service"
+          if ! printf '%s' "${namespace}" | grep -Eq "${label}" || [ "${#namespace}" -gt 63 ]; then
+            die "deployment.namespace '${namespace}' is not a valid namespace name (lower case letters, digits, '-'; at most 63 characters)"
+          fi
+          case "${namespace}" in
+            "${ENVIRONMENT}"-?*) ;;
+            *) die "deployment.namespace '${namespace}' does not belong to the environment ${ENVIRONMENT}: namespaces of ${ENVIRONMENT} start with '${ENVIRONMENT}-' (check ${envfile})" ;;
+          esac
+          [ -n "${release}" ] || die "deployment.release is not set in ${common} or ${envfile}"
+          if ! printf '%s' "${release}" | grep -Eq "${label}" || [ "${#release}" -gt 40 ]; then
+            die "deployment.release '${release}' must match ${label} and have at most 40 characters"
+          fi
+          if [ -n "${RELEASE_INPUT}" ] && [ "${RELEASE_INPUT}" != "${release}" ]; then
+            die "input release '${RELEASE_INPUT}' contradicts deployment.release '${release}' of the values (the input is deprecated - remove it)"
+          fi
+          if [ -n "${BUNDLE_SECRET_INPUT}" ]; then
+            if [ -z "${bundle_secret}" ]; then
+              bundle_secret="${BUNDLE_SECRET_INPUT}"
+              echo "::warning::input env-bundle-secret is deprecated: declare deployment.envBundle.secret: ${bundle_secret} in ${common}"
+            elif [ "${bundle_secret}" != "${BUNDLE_SECRET_INPUT}" ]; then
+              die "input env-bundle-secret '${BUNDLE_SECRET_INPUT}' contradicts deployment.envBundle.secret '${bundle_secret}' of the values"
+            fi
+          fi
+          if [ -n "${bundle_secret}" ]; then
+            printf '%s' "${bundle_secret}" | grep -Eq "${label}" || die "deployment.envBundle.secret '${bundle_secret}' is not a Secret name of requiredSecrets"
+          fi
+
+          # The chart does not know `deployment`: Helm gets copies of the two files without it.
+          mkdir -p "${RUNNER_TEMP}/values"
+          yq 'del(.deployment)' "${common}" > "${RUNNER_TEMP}/values/values.yaml"
+          yq 'del(.deployment)' "${envfile}" > "${RUNNER_TEMP}/values/values-${ENVIRONMENT}.yaml"
+          {
+            echo "namespace=${namespace}"
+            echo "release=${release}"
+            echo "bundle-secret=${bundle_secret}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Deployment from ${VALUES_DIR}: release ${release} in namespace ${namespace}${bundle_secret:+; env-bundle -> Secret ${release}-${bundle_secret}}"
 
       # One JSON object with the configuration of the target environment (secret env-bundle). This step only
       # classifies and checks it: nothing is written anywhere, and no value is printed - messages carry names.
@@ -277,7 +330,7 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           VALUES_DIR: ${{ inputs.values-dir }}
           ENV_BUNDLE: ${{ secrets.env-bundle }}
-          BUNDLE_SECRET: ${{ inputs.env-bundle-secret }}
+          BUNDLE_SECRET: ${{ steps.identity.outputs.bundle-secret }}
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
@@ -565,14 +618,15 @@ jobs:
           CHART_VERSION: ${{ inputs.chart-version }}
           VALUES_DIR: ${{ inputs.values-dir }}
           RUN_MIGRATIONS: ${{ inputs.run-migrations }}
-          NAMESPACE: ${{ steps.target.outputs.namespace }}
-          RELEASE: ${{ steps.target.outputs.release }}
+          NAMESPACE: ${{ steps.identity.outputs.namespace }}
+          RELEASE: ${{ steps.identity.outputs.release }}
           CHART: ${{ steps.target.outputs.chart }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for f in "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"; do
-            test -f "${f}" || { echo "::error::values file not found: ${f}"; exit 1; }
+          values="${RUNNER_TEMP}/values"   # the values of the service without `deployment` (step identity)
+          for f in "${values}/values.yaml" "${values}/values-${ENVIRONMENT}.yaml"; do
+            test -f "${f}" || { echo "::error::prepared values file not found: ${f}"; exit 1; }
           done
           # The chart package is private: log in with the job token (packages: read). The token is read
           # from stdin, never from the command line, and the login is removed again right after the pull.
@@ -596,7 +650,7 @@ jobs:
           esac
           common=(
             "${RELEASE}" "${chart_dir}" --namespace "${NAMESPACE}"
-            -f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"
+            -f "${values}/values.yaml" -f "${values}/values-${ENVIRONMENT}.yaml"
             -f "${RUNNER_TEMP}/overrides.json"
             --set-string "image.digest=${DIGEST}"
           )
@@ -689,7 +743,29 @@ jobs:
           curl -fsSLo "${bin}/kubectl" "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
           echo "${KUBECTL_SHA256}  ${bin}/kubectl" | sha256sum -c -
           chmod +x "${bin}/kubectl"
+          # yq: the runner image has none (values and the migration manifest are read with it).
+          curl -fsSLo "${bin}/yq" "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  ${bin}/yq" | sha256sum -c -
+          chmod +x "${bin}/yq"
           echo "${bin}" >> "${GITHUB_PATH}"
+
+      # The same namespace and release as the validate job, read again from the same commit: a mismatch
+      # stops here, before the first request to the cluster. Helm gets copies of the values without
+      # `deployment`, exactly as in the validate job.
+      - name: Prepare values
+        run: |
+          set -euo pipefail
+          common="${VALUES_DIR}/values.yaml"; envfile="${VALUES_DIR}/values-${ENVIRONMENT}.yaml"
+          for f in "${common}" "${envfile}"; do test -f "${f}" || { echo "::error::values file not found: ${f}"; exit 1; }; done
+          # shellcheck disable=SC2016  # yq program, not shell
+          got="$(yq ea '. as $doc ireduce ({}; . * $doc) | (.deployment.namespace // "") + " " + (.deployment.release // "")' "${common}" "${envfile}")"
+          if [ -z "${NAMESPACE}" ] || [ -z "${RELEASE}" ] || [ "${got}" != "${NAMESPACE} ${RELEASE}" ]; then
+            echo "::error::the values resolve to '${got}', the validate job resolved '${NAMESPACE} ${RELEASE}' - nothing was changed"; exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/values"
+          yq 'del(.deployment)' "${common}" > "${RUNNER_TEMP}/values/values.yaml"
+          yq 'del(.deployment)' "${envfile}" > "${RUNNER_TEMP}/values/values-${ENVIRONMENT}.yaml"
+          echo "Target: release ${RELEASE} in namespace ${NAMESPACE} (deployment.* of ${VALUES_DIR})"
 
       # Exactly the overrides the validate job resolved and validated: both jobs render the same configuration.
       - name: Apply variable overrides
@@ -713,12 +789,42 @@ jobs:
             kubectl auth can-i ${check} --namespace "${NAMESPACE}" --quiet \
               || { echo "::error::the runner ServiceAccount may not '${check}' in ${NAMESPACE}"; exit 1; }
           done
-          # Access to individual, named Secrets (ciManagedSecrets) is expected; access to all of them is not.
-          for verb in get list create; do
-            if kubectl auth can-i "${verb}" secrets --namespace "${NAMESPACE}" --quiet; then
-              echo "::warning::the runner ServiceAccount can ${verb} every Secret in ${NAMESPACE}; the deployer role should not allow that"
-            fi
-          done
+          # Reading, creating and patching application Secrets is expected; enumerating them is not.
+          if kubectl auth can-i list secrets --namespace "${NAMESPACE}" --quiet; then
+            echo "::warning::the runner ServiceAccount can list every Secret in ${NAMESPACE}; the deployer role should not allow that"
+          fi
+
+      # A release belongs to the repository that installed it (Helm release label OWNER_LABEL). Two services
+      # that share a namespace can therefore never upgrade, roll back or replace each other's release, even
+      # when a values file names the wrong release. A release without the label (installed by an earlier
+      # version of this workflow) is adopted by the next deployment.
+      - name: Check release ownership
+        id: owner
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$1"; exit 1; }
+          me="$(printf '%s' "${GITHUB_REPOSITORY}" | tr '/' '.')"
+          if [ "${#me}" -gt 63 ] || ! printf '%s' "${me}" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'; then
+            me="sha256-$(printf '%s' "${GITHUB_REPOSITORY}" | sha256sum | cut -c1-40)"
+          fi
+          if ! records="$(kubectl --namespace "${NAMESPACE}" get configmaps -l "owner=helm,name=${RELEASE}" -o json 2>&1)"; then
+            case "${records}" in
+              *Forbidden*|*forbidden*) die "the runner may not list the Helm release records (ConfigMaps) in ${NAMESPACE} - nothing was changed" ;;
+              *) die "cannot read the Helm release records of ${RELEASE} in ${NAMESPACE}: the Kubernetes API did not answer (the response is not shown) - nothing was changed" ;;
+            esac
+          fi
+          count="$(printf '%s' "${records}" | jq '.items | length')"
+          owners="$(printf '%s' "${records}" | jq -r --arg k "${OWNER_LABEL}" '[.items[].metadata.labels[$k] // empty] | unique | join(" ")')"
+          if [ "${count}" = "0" ]; then
+            echo "Release ${RELEASE} does not exist in ${NAMESPACE} yet; it will belong to ${GITHUB_REPOSITORY}."
+          elif [ -z "${owners}" ]; then
+            echo "::notice::release ${RELEASE} in ${NAMESPACE} carries no owner label yet (installed by an earlier version); this deployment assigns it to ${GITHUB_REPOSITORY}"
+          elif [ "${owners}" != "${me}" ]; then
+            die "release ${RELEASE} in ${NAMESPACE} belongs to ${owners}, not to ${GITHUB_REPOSITORY}: deployment.release / deployment.namespace of the values point at another service's release - nothing was changed"
+          else
+            echo "Release ${RELEASE} in ${NAMESPACE} belongs to ${GITHUB_REPOSITORY}."
+          fi
+          echo "label=${OWNER_LABEL}=${me}" >> "${GITHUB_OUTPUT}"
 
       - name: Fetch the chart
         id: chart
@@ -726,9 +832,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for f in "${VALUES_DIR}/values.yaml" "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"; do
-            test -f "${f}" || { echo "::error::values file not found: ${f}"; exit 1; }
-          done
           # The chart package is private: log in with the job token (packages: read). The token is read
           # from stdin, never from the command line, and the login is removed again right after the pull.
           pull_chart() {
@@ -758,7 +861,7 @@ jobs:
       # the values files - only names cross between the jobs) or app-secrets (explicit lines).
       #   app-secrets, declared env-bundle   server-side apply owns exactly the keys supplied in this run; the
       #                                      Secret object must already exist (the runner needs get + patch)
-      #   pass-through env-bundle            (input env-bundle-secret) the Secret is CREATED with the complete
+      #   pass-through env-bundle            (deployment.envBundle.secret) the Secret is CREATED with the complete
       #                                      payload when it does not exist, otherwise the supplied keys are
       #                                      merged into it: no other key is touched or removed. The runner
       #                                      needs get + patch, and create for the first deployment.
@@ -770,7 +873,7 @@ jobs:
           ENV_BUNDLE: ${{ secrets.env-bundle }}
           DECLARED: ${{ needs.validate.outputs.declared-secrets }}
           PLAN: ${{ needs.validate.outputs.secret-plan }}
-          BUNDLE_SECRET: ${{ inputs.env-bundle-secret }}
+          BUNDLE_SECRET: ${{ needs.validate.outputs.bundle-secret }}
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
@@ -999,30 +1102,40 @@ jobs:
           SHADOWED: ${{ needs.validate.outputs.bundle-shadowed }}
         run: |
           set -euo pipefail
+          die() { echo "::error::$1"; exit 1; }
           run_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          values="${RUNNER_TEMP}/values"
           helm template "${RELEASE}" "${CHART_DIR}" --namespace "${NAMESPACE}" \
-            -f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml" \
+            -f "${values}/values.yaml" -f "${values}/values-${ENVIRONMENT}.yaml" \
             -f "${RUNNER_TEMP}/overrides.json" \
             --set-string "image.digest=${DIGEST}" \
             --set migration.render=true --set-string "migration.runId=${run_id}" \
             --show-only templates/migration-job.yaml > "${RUNNER_TEMP}/migration.yaml"
           job="${RELEASE}-migrate-${run_id}"
-          if [ -n "${SHADOWED:-}" ]; then
-            # Pass-through bundle: these names come from the Secret. Their explicit env entries (values files)
-            # are dropped from the Job so that the Secret is not overridden; migration.config stays untouched.
-            # Only names are handled here - the manifest contains no Secret value.
-            for name in ${SHADOWED}; do
-              printf '%s' "${name}" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$' || { echo "::error::malformed list of bundle names"; exit 1; }
-            done
-            command -v jq >/dev/null 2>&1 || { echo "::error::jq is not available on the runner; the migration Job cannot be prepared"; exit 1; }
-            # shellcheck disable=SC2016  # jq program, not shell
-            kubectl create --dry-run=client -o json -f "${RUNNER_TEMP}/migration.yaml" \
-              | jq --arg names "${SHADOWED}" '($names | split(" ")) as $drop
-                    | .spec.template.spec.containers |= map(if .env then .env |= map(select(.name as $n | ($drop | index($n)) | not)) else . end)' \
-              | kubectl --namespace "${NAMESPACE}" create -f -
-          else
-            kubectl --namespace "${NAMESPACE}" create -f "${RUNNER_TEMP}/migration.yaml"
-          fi
+          # Pass-through bundle: these names come from the Secret. Their explicit env entries (values files)
+          # are dropped from the Job so that the Secret is not overridden; migration.config stays untouched.
+          for name in ${SHADOWED:-}; do
+            printf '%s' "${name}" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$' || die "malformed list of bundle names"
+          done
+          command -v jq >/dev/null 2>&1 || die "jq is not available on the runner; the migration Job cannot be prepared"
+          # YAML -> JSON with yq. Never through a kubectl client-side dry run: that fills in the namespace of
+          # the client's own context - on this runner the namespace of its ServiceAccount (arc-runners).
+          # shellcheck disable=SC2016  # yq / jq programs, not shell
+          objects="$(yq ea -o=json -I0 '[select(. != null)]' "${RUNNER_TEMP}/migration.yaml")"
+          [ "$(printf '%s' "${objects}" | jq 'length')" = "1" ] || die "the migration template must render exactly one object"
+          got="$(printf '%s' "${objects}" | jq -r '.[0] | .kind + " " + .metadata.name + " " + (.metadata.namespace // "-")')"
+          case "${got}" in
+            "Job ${job} -"|"Job ${job} ${NAMESPACE}") ;;
+            *) die "the rendered migration object is '${got}', expected Job ${job} in ${NAMESPACE} - nothing was created" ;;
+          esac
+          # The target namespace is written into the object itself, so the object and the request agree.
+          # shellcheck disable=SC2016  # jq program, not shell
+          printf '%s' "${objects}" \
+            | jq -c --arg ns "${NAMESPACE}" --arg names "${SHADOWED:-}" '.[0]
+                | .metadata.namespace = $ns
+                | ($names | split(" ") | map(select(. != ""))) as $drop
+                | .spec.template.spec.containers |= map(if .env then .env |= map(select(.name as $n | ($drop | index($n)) | not)) else . end)' \
+            | kubectl --namespace "${NAMESPACE}" create -f -
 
           seconds="${TIMEOUT%[sm]}"; case "${TIMEOUT}" in *m) seconds=$((seconds * 60)) ;; esac
           deadline=$(( $(date +%s) + seconds ))
@@ -1045,14 +1158,17 @@ jobs:
         env:
           CHART_DIR: ${{ steps.chart.outputs.dir }}
           RESTART: ${{ inputs.restart }}
+          OWNER_LABEL_VALUE: ${{ steps.owner.outputs.label }}
           # Environment variables from a Secret are read at pod start: a changed Secret needs new pods.
           SECRETS_CHANGED: ${{ steps.secrets.outputs.changed }}
         run: |
           set -euo pipefail
+          values="${RUNNER_TEMP}/values"   # the values of the service without `deployment` (step "Prepare values")
           args=(
             upgrade --install "${RELEASE}" "${CHART_DIR}" --namespace "${NAMESPACE}"
-            -f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"
+            -f "${values}/values.yaml" -f "${values}/values-${ENVIRONMENT}.yaml"
             -f "${RUNNER_TEMP}/overrides.json"
+            --labels "${OWNER_LABEL_VALUE}"
             --set-string "image.digest=${DIGEST}"
             --set migration.render=false
             --rollback-on-failure --wait --timeout "${TIMEOUT}" --history-max 20
@@ -1108,8 +1224,9 @@ jobs:
             echo
             echo "| | |"
             echo "|---|---|"
-            echo "| Release | \`${RELEASE}\` |"
-            echo "| Namespace | \`${NAMESPACE}\` |"
+            echo "| Release | \`${RELEASE}\` (deployment.release) |"
+            echo "| Namespace | \`${NAMESPACE}\` (deployment.namespace) |"
+            echo "| Repository | \`${GITHUB_REPOSITORY}\` |"
             echo "| Image digest | \`${DIGEST}\` |"
             echo "| Chart | \`${CHART}\` ${CHART_VERSION} |"
             echo "| Values commit | \`${GITHUB_SHA}\` |"

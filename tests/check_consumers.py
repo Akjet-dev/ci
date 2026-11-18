@@ -20,7 +20,11 @@ Rules (static: nothing is executed on GitHub, nothing is deployed)
       never from a repository secret of another environment
   K7  a call of a local reusable workflow (./.github/workflows/x.yml) matches that file's own interface
   K8  chart-version equals the version of charts/akjet-app
-  K9  the namespace the candidate resolves for the repository is the one the platform expects
+  K9  the namespace and release come from the consumer's own values (deployment.*), resolved by the
+      candidate's identity step; the namespace is the one the platform provides (tests/consumers.yaml)
+  K11 consumers that share a namespace declare different releases
+  K12 the image is declared in the values (image.repository under ghcr.io/<owner>/); a build call that
+      still passes the deprecated `image` input names the same image
   K10 every consumer pins the same revision (reported; an error with --expect-sha / --strict-sha)
 With a workspace, additionally (H = Helm, D = Docker build contract, O = opt-in behaviour):
   H1  values of dev and stage: helm lint, helm template, kubeconform, security policy, allowed kinds
@@ -84,10 +88,26 @@ def literal(value):
     return not (isinstance(value, str) and EXPR.search(value))
 
 
+def values_identity(repo_dir):
+    """deployment.* per environment and image.repository, read from the values files (no other values)."""
+    deploy = pathlib.Path(repo_dir) / "deploy"
+    out = {"deployment": {}, "image": None}
+    if not (deploy / "values.yaml").exists():
+        return out
+    out["image"] = yq_json(deploy / "values.yaml").get("image", {}).get("repository")
+    for env in ("dev", "stage"):
+        files = [str(deploy / "values.yaml")] + ([str(deploy / f"values-{env}.yaml")] if (deploy / f"values-{env}.yaml").exists() else [])
+        merged = subprocess.run(["yq", "ea", "-o=json", ". as $d ireduce ({}; . * $d) | .deployment // {}"] + files,
+                                check=True, capture_output=True, text=True).stdout
+        out["deployment"][env] = json.loads(merged or "{}")
+    return out
+
+
 def extract(repo_dir):
-    """Snapshot of the calls of one consumer: what it passes to which workflow. No workflow bodies."""
+    """Snapshot of the calls of one consumer: what it passes to which workflow, and its deployment identity
+    from the values. No workflow bodies, no other values."""
     wf_dir = pathlib.Path(repo_dir) / ".github/workflows"
-    snap = {"workflows": {}}
+    snap = {"workflows": {}, "values": values_identity(repo_dir)}
     for path in sorted(wf_dir.glob("*.y*ml")):
         text = path.read_text(encoding="utf-8")
         doc = yq_json(path)
@@ -121,7 +141,9 @@ def extract(repo_dir):
 
 
 def without_refs(snap):
-    """A snapshot is stale when the CALLS changed, not when a consumer merely moved to another revision."""
+    """A snapshot is stale when the calls or the deployment identity changed, not when a consumer merely moved
+    to another revision."""
+    snap.setdefault("values", None)
     for wf in snap["workflows"].values():
         for call in wf["calls"]:
             call["ref"] = None if call["ref"] is None else "pinned"
@@ -206,8 +228,32 @@ def check_consumer(consumer, snap, ifaces, chart_version, errs, notes):
     return refs
 
 
+def resolve_identity(workflow_file, snap, environment):
+    """Runs the real identity step of a deploy-k8s.yml on the consumer's deployment block.
+    Returns (outputs, error); outputs is None when the revision has no identity step."""
+    step = subprocess.run(["yq", '.jobs.validate.steps[] | select(.id == "identity") | .run', str(workflow_file)],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    if not step:
+        return None, None
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        (tmp / "deploy").mkdir()
+        meta = (snap.get("values") or {}).get("deployment", {}).get(environment, {})
+        (tmp / "deploy/values.yaml").write_text(json.dumps({"deployment": meta}) + "\n")
+        (tmp / f"deploy/values-{environment}.yaml").write_text("{}\n")
+        out = tmp / "out"
+        out.write_text("")
+        env = {"PATH": os.environ["PATH"], "RUNNER_TEMP": str(tmp / "rt"), "GITHUB_OUTPUT": str(out), "ENVIRONMENT": environment,
+               "VALUES_DIR": "deploy", "RELEASE_INPUT": "", "BUNDLE_SECRET_INPUT": ""}
+        run = subprocess.run(["bash", "--noprofile", "--norc", "-c", step], env=env, cwd=tmp, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        if run.returncode != 0:
+            msg = [l for l in (run.stdout + run.stderr).splitlines() if l.startswith("::error::")]
+            return {}, (msg[-1][9:] if msg else "the identity step failed")
+        return dict(l.split("=", 1) for l in out.read_text().splitlines() if "=" in l), None
+
+
 def resolve_namespace(workflow_file, repository, environment):
-    """Runs the real 'Resolve and check the target' step of a deploy-k8s.yml (validation-only)."""
+    """Legacy revisions (namespace derived from the repository): runs their 'Resolve and check the target' step."""
     step = subprocess.run(["yq", ".jobs.validate.steps[0].run", str(workflow_file)], check=True, capture_output=True, text=True).stdout
     with tempfile.TemporaryDirectory() as tmp:
         out = pathlib.Path(tmp) / "out"
@@ -229,7 +275,7 @@ def run_step(workflow_file, selector, env, cwd):
                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
 
 
-def check_repo(consumer, repo, snap, root, errs, notes, skipped):
+def check_repo(consumer, repo, snap, root, errs, notes, skipped, identity):
     """Rules that need the files of the consumer: Helm values, Docker build contract, opt-in behaviour."""
     name = consumer["name"]
     dk = root / ".github/workflows/deploy-k8s.yml"
@@ -276,15 +322,24 @@ def check_repo(consumer, repo, snap, root, errs, notes, skipped):
             if not have["helm"]:
                 skipped.add("H1 (helm not installed)")
                 continue
-            common = ["-f", str(values[0]), "-f", str(values[1]), "--set-string", "image.digest=sha256:" + "0" * 64]
+            # Helm gets the values without `deployment`, exactly as the workflow hands them over.
+            stripped = []
+            for v in values:
+                target = tmp / f"helm-{env}-{v.name}"
+                target.write_text(subprocess.run(["yq", "del(.deployment)", str(v)], check=True, capture_output=True, text=True).stdout)
+                stripped.append(target)
+            common = ["-f", str(stripped[0]), "-f", str(stripped[1]), "--set-string", "image.digest=sha256:" + "0" * 64]
             chart = str(root / "charts/akjet-app")
             lint = subprocess.run(["helm", "lint", chart] + common, capture_output=True, text=True)
             if lint.returncode != 0:
                 errs.append(f"H1 {name} ({env}): helm lint failed: {lint.stdout.strip().splitlines()[-3:]}")
                 continue
-            ns = (consumer.get("namespace") or {}).get(env, f"{env}-{name}")
+            ident = identity.get(env) or {}
+            if not ident.get("namespace") or not ident.get("release"):
+                skipped.add(f"H1 {name} ({env}): no valid deployment identity (see K9)")
+                continue
             rendered = tmp / f"{name}-{env}.yaml"
-            tpl = subprocess.run(["helm", "template", name, chart, "--namespace", ns] + common, capture_output=True, text=True)
+            tpl = subprocess.run(["helm", "template", ident["release"], chart, "--namespace", ident["namespace"]] + common, capture_output=True, text=True)
             if tpl.returncode != 0:
                 errs.append(f"H1 {name} ({env}): helm template failed: {tpl.stderr.strip().splitlines()[-2:]}")
                 continue
@@ -344,7 +399,7 @@ def main():
     chart_version = re.search(r"^version:\s*(\S+)", (ROOT / "charts/akjet-app/Chart.yaml").read_text(), re.M).group(1)
     snap_dir = pathlib.Path(a.snapshots)
     errs, notes, skipped, rows = [], [], set(), []
-    all_refs = {}
+    all_refs, shared = {}, {}
     dk = ROOT / ".github/workflows/deploy-k8s.yml"
 
     for consumer in manifest["consumers"]:
@@ -369,14 +424,29 @@ def main():
         before = len(errs)
         refs = check_consumer(consumer, snap, ifaces, chart_version, errs, notes)
         all_refs[name] = refs
-        got = {}
+        got, identity = {}, {}
         for env in ("dev", "stage"):
             want = (consumer.get("namespace") or {}).get(env)
-            got[env] = resolve_namespace(dk, consumer["repository"], env)
-            if want and got[env] != want:
-                errs.append(f"K9 {name}: the candidate resolves {env} to namespace {got[env]}, the platform expects {want}")
+            ident, problem = resolve_identity(dk, snap, env)
+            identity[env] = ident or {}
+            got[env] = (ident or {}).get("namespace")
+            if problem:
+                errs.append(f"K9 {name} ({env}): {problem}")
+            elif want and got[env] != want:
+                errs.append(f"K9 {name}: values-{env}.yaml targets namespace {got[env]}, the platform provides {want}")
+            if ident and ident.get("namespace"):
+                shared.setdefault((env, ident["namespace"]), []).append((name, ident.get("release")))
+        image = (snap.get("values") or {}).get("image")
+        owner = consumer["repository"].split("/")[0].lower()
+        if not image or not re.fullmatch(r"ghcr\.io/%s/[a-z0-9]([a-z0-9._/-]*[a-z0-9])?" % re.escape(owner), str(image)):
+            errs.append(f"K12 {name}: image.repository of deploy/values.yaml must name an image under ghcr.io/{owner}/ (got {image!r})")
+        for wf in snap["workflows"].values():
+            for c in wf["calls"]:
+                legacy = (c["with"] or {}).get("image") if c["uses"] == "build-image.yml" else None
+                if legacy and image and f"ghcr.io/{owner}/{legacy}" != image:
+                    errs.append(f"K12 {name}: the build call names image {legacy}, the values deploy {image}")
         if source == "workspace":
-            check_repo(consumer, repo, snap, ROOT, errs, notes, skipped)
+            check_repo(consumer, repo, snap, ROOT, errs, notes, skipped, identity)
         features = sorted({s for wf in snap["workflows"].values() for c in wf["calls"] if c["uses"] in REUSABLE and isinstance(c["secrets"], dict) for s in c["secrets"]})
         migrations = any("run-migrations" in (c["with"] or {}) for wf in snap["workflows"].values() for c in wf["calls"] if c["uses"] == "deploy-k8s.yml")
         rows.append((name, source, ",".join(sorted(r[:7] for r in refs)) or "-", got.get("dev") or "?", ", ".join(features) or "-",
@@ -399,12 +469,22 @@ def main():
                     check_consumer(consumer, snap, old, chart_version, olderrs, [])
                     for env in ("dev", "stage"):
                         want = (consumer.get("namespace") or {}).get(env)
-                        ns = resolve_namespace(pathlib.Path(tmp) / "deploy-k8s.yml", consumer["repository"], env)
-                        if want and ns != want:
+                        ident, problem = resolve_identity(pathlib.Path(tmp) / "deploy-k8s.yml", snap, env)
+                        if ident is None and ((snap.get("values") or {}).get("deployment") or {}).get(env):
+                            olderrs.append(f"K9 {name} ({env}): revision {ref[:7]} hands the values to Helm unchanged, and the chart rejects "
+                                           "the deployment block - commit the values together with the new revision (scripts/update-ci-sha.sh)")
+                        ns = (ident or {}).get("namespace") if ident is not None else resolve_namespace(pathlib.Path(tmp) / "deploy-k8s.yml", consumer["repository"], env)
+                        if problem:
+                            olderrs.append(f"K9 {name} ({env}): {problem}")
+                        elif want and ns != want:
                             olderrs.append(f"K9 {name}: revision {ref[:7]} resolves {env} to namespace {ns}, the platform expects {want}")
                     for e in olderrs:
                         notes.append(f"PINNED@{ref[:7]} {e}")
 
+    for (env, ns), members in sorted(shared.items()):
+        releases = [r for _, r in members]
+        if len(releases) != len(set(releases)):
+            errs.append(f"K11 {env} namespace {ns}: {', '.join(f'{n}={r}' for n, r in members)} - services that share a namespace need different releases")
     distinct = sorted({r for refs in all_refs.values() for r in refs})
     if len(distinct) > 1:
         msg = "K10 consumers pin different revisions: " + ", ".join(f"{n}={'/'.join(sorted(x[:7] for x in r)) or '-'}" for n, r in all_refs.items())

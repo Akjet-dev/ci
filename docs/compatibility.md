@@ -23,7 +23,7 @@
 | Возможность | Включается | Если не передано |
 |---|---|---|
 | Набор окружения | секрет `env-bundle` | шаг сообщает «No env-bundle was passed» и ничего не делает |
-| Сквозной режим набора | вход `env-bundle-secret` вместе с `env-bundle` | набор проверяется по объявлениям сервиса, как раньше |
+| Сквозной режим набора | `deployment.envBundle.secret` в values вместе с `env-bundle` | набор проверяется по объявлениям сервиса, как раньше |
 | Явные секреты приложения | секрет `app-secrets` | Kubernetes Secret'ы не трогаются, `kubectl` не вызывается |
 | Миграции | вход `run-migrations: true` | Job не рендерится и не создаётся |
 | Переопределения переменными | файл `deploy/overrides.yaml` | действуют values-файлы |
@@ -55,7 +55,8 @@ tests/check_consumers.py --workspace .. --against-pinned    # только со�
 Правила: K1 ссылка на существующий workflow и полный SHA; K2 входы; K3 секреты (в том числе «Invalid secret,
 … is not defined in the referenced workflow»); K4 выходы; K5 права токена; K6 секреты рантайма только при
 деплое в `dev`, не вместе и не из чужого окружения; K7 локальные reusable workflow; K8 версия чарта; K9
-неймспейс совпадает с платформой; K10 одна ревизия у всех. По файлам сервиса дополнительно: H1 Helm
+неймспейс и релиз берутся из values сервиса и неймспейс совпадает с платформой; K10 одна ревизия у всех; K11 сервисы
+в одном неймспейсе объявляют разные релизы; K12 образ объявлен в values. По файлам сервиса дополнительно: H1 Helm
 (`lint`, `template`, `kubeconform`, политика безопасности), D1 контракт сборки Docker, O1 необязательные шаги
 без входов ничего не делают.
 
@@ -96,3 +97,16 @@ tests/check_consumers.py --workspace .. --against-pinned    # только со�
 `scripts/update-ci-sha.sh` меняет только строки `uses: Akjet-dev/ci/.github/workflows/(deploy-k8s|build-image).yml@<sha>`
 в `k8s-*.yml`. Ссылки на другие actions, включая `Akjet-dev/ci/netbird@…` действующего деплоя, не трогаются.
 Ревизия должна быть полным SHA коммита из `origin/main`; ветки, теги и заглушка из нулей отклоняются.
+
+## Шестой сервис
+
+Код `ci` не меняется. Нужно:
+
+1. Платформа: неймспейс (или решение жить в существующем), квота, сетевой доступ, маршрут — `k8s-infra`.
+2. Сервис: `Dockerfile`, `deploy/values.yaml` (`deployment.release`, `image.repository`, `components`, при
+   необходимости `requiredSecrets`, `migration`, `deployment.envBundle.secret`), `deploy/values-dev.yaml` и
+   `values-stage.yaml` с `deployment.namespace`.
+3. Сервис: `.github/workflows/k8s-build.yml` и `k8s-deploy.yml` из `examples/service-repo/` со ссылкой на
+   опубликованный SHA `ci`.
+4. `ci`: строка в `tests/consumers.yaml` и снимок `tests/check_consumers.py --workspace .. --write-snapshots` —
+   это список для проверки совместимости, не логика деплоя.

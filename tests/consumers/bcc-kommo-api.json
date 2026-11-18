@@ -1,4 +1,17 @@
 {
+ "values": {
+  "deployment": {
+   "dev": {
+    "namespace": "dev-bcc-kommo-api",
+    "release": "bcc-kommo-api"
+   },
+   "stage": {
+    "namespace": "stage-bcc-kommo-api",
+    "release": "bcc-kommo-api"
+   }
+  },
+  "image": "ghcr.io/akjet-dev/bcc-kommo-api"
+ },
  "workflows": {
   "k8s-build.yml": {
    "calls": [
@@ -10,7 +23,7 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "842573924b7f95d568c6393fd3e3dc45252932c3",
+     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
      "secrets": {},
      "uses": "deploy-k8s.yml",
      "with": {
@@ -29,7 +42,7 @@
       "contents": "read",
       "packages": "write"
      },
-     "ref": "842573924b7f95d568c6393fd3e3dc45252932c3",
+     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
      "secrets": {},
      "uses": "build-image.yml",
      "with": {
@@ -66,7 +79,7 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "842573924b7f95d568c6393fd3e3dc45252932c3",
+     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
      "secrets": {},
      "uses": "deploy-k8s.yml",
      "with": {

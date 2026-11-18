@@ -246,18 +246,15 @@ reject() {
 }
 
 accept "push to dev-k8s/release deploys to dev" "deploy=true" dev refs/heads/dev-k8s/release push false
-if out "namespace=dev-example-api" && out "runner=akjet-ds-apps" && out "release=example-api" \
-   && out "chart=oci://ghcr.io/example-org/charts/akjet-app"; then
-  pass "namespace is derived from the repository (dev-example-api); runner is the shared akjet-ds-apps"
+if out "runner=akjet-ds-apps" && out "chart=oci://ghcr.io/example-org/charts/akjet-app" && ! grep -qE '^(namespace|release)=' "$WORK/gh_output"; then
+  pass "the target check decides environment, branch, runner and chart only - it resolves no namespace and no release"
 else
   fail "derived target"; cat "$WORK/gh_output"
 fi
 accept "the runner label does not depend on the repository" "runner=akjet-ds-apps" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy "" Example-Org/other-service
 accept "manual run on dev-k8s/release deploys to dev" "deploy=true" dev refs/heads/dev-k8s/release workflow_dispatch false
-accept "another release name stays in the same namespace" "namespace=dev-example-api" dev refs/heads/dev-k8s/release push false "$good_digest" satellite
 accept "other dev-k8s/* branch: validation only, no deployment" "deploy=false" dev refs/heads/dev-k8s/feature-x push true ""
 accept "stage-k8s/release: stage values are validated, no deployment" "deploy=false" stage refs/heads/stage-k8s/release push true ""
-if out "namespace=stage-example-api"; then pass "stage validation renders for namespace stage-example-api"; else fail "stage namespace"; fi
 
 reject "deploy to dev from main" dev refs/heads/main push false
 reject "deploy to dev from dev/v1" dev refs/heads/dev/v1 push false
@@ -280,27 +277,135 @@ reject "mutable tag instead of digest" dev refs/heads/dev-k8s/release push false
 reject "deployment without a digest" dev refs/heads/dev-k8s/release push false ""
 reject "truncated digest" dev refs/heads/dev-k8s/release push false sha256:abc
 reject "floating chart version" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy "" "" 1.x
-reject "release with shell metacharacters" dev refs/heads/dev-k8s/release push false "$good_digest" 'x;id'
 reject "values-dir outside the repository" dev refs/heads/dev-k8s/release push false "$good_digest" "" ../other
 reject "chart from an arbitrary URL" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy https://example.test/chart.tgz
-reject "repository name unusable as namespace" dev refs/heads/dev-k8s/release push false "$good_digest" "" deploy "" Example-Org/Example_API
 
-echo "== deploy-k8s.yml: namespaces shared by several repositories"
-rel=(dev refs/heads/dev-k8s/release push false "$good_digest")
-accept "backend deploys to the shared namespace dev-lk-backend" "namespace=dev-lk-backend" "${rel[@]}" "" deploy "" Akjet-dev/backend
-if out "release=backend"; then pass "backend keeps its own release name"; else fail "release of backend"; cat "$WORK/gh_output"; fi
-accept "lk-frontend deploys to the same namespace dev-lk-backend" "namespace=dev-lk-backend" "${rel[@]}" "" deploy "" Akjet-dev/lk-frontend
-if out "release=lk-frontend"; then pass "lk-frontend keeps its own release name"; else fail "release of lk-frontend"; cat "$WORK/gh_output"; fi
-accept "backend: stage values are validated for stage-lk-backend" "namespace=stage-lk-backend" stage refs/heads/stage-k8s/release push true "" "" deploy "" Akjet-dev/backend
-accept "lk-frontend: stage values are validated for stage-lk-backend" "namespace=stage-lk-backend" stage refs/heads/stage-k8s/release push true "" "" deploy "" Akjet-dev/lk-frontend
-accept "shared namespace: a second release of the same repository is allowed" "release=backend-tools" "${rel[@]}" backend-tools deploy "" Akjet-dev/backend
-reject "shared namespace: lk-frontend cannot manage the release 'backend'" "${rel[@]}" backend deploy "" Akjet-dev/lk-frontend
-reject "shared namespace: backend cannot manage the release 'lk-frontend'" "${rel[@]}" lk-frontend deploy "" Akjet-dev/backend
-reject "shared namespace: backend cannot manage an arbitrary release name" "${rel[@]}" satellite deploy "" Akjet-dev/backend
-for other in executor-frontend landing bcc-kommo-api; do
-  accept "$other keeps its own namespace dev-$other" "namespace=dev-$other" "${rel[@]}" "" deploy "" "Akjet-dev/$other"
-  accept "$other keeps its own namespace stage-$other" "namespace=stage-$other" stage refs/heads/stage-k8s/release push true "" "" deploy "" "Akjet-dev/$other"
-done
+echo "== deploy-k8s.yml: namespace and release come only from the values of the service"
+id_step="$(yq '.jobs.validate.steps[] | select(.id == "identity") | .run' "$dk")"
+idw="$WORK/identity"
+id_values() {  # common values.yaml text, env file text, [environment=dev]
+  rm -rf "$idw"; mkdir -p "$idw/deploy"
+  printf '%s\n' "$1" >"$idw/deploy/values.yaml"; printf '%s\n' "$2" >"$idw/deploy/values-${3:-dev}.yaml"
+}
+id_run() {  # environment, [release input], [env-bundle-secret input], [repository] -> outputs in $WORK/id_output
+  : >"$WORK/id_output"
+  ( cd "$idw" && env -i PATH="$PATH" RUNNER_TEMP="$idw/tmp" GITHUB_OUTPUT="$WORK/id_output" GITHUB_REPOSITORY="${4:-Example-Org/example-api}" \
+      ENVIRONMENT="$1" VALUES_DIR=deploy RELEASE_INPUT="${2:-}" BUNDLE_SECRET_INPUT="${3:-}" bash --noprofile --norc -c "$id_step" ) </dev/null >"$WORK/id.log" 2>&1
+}
+id_out() { sed -n "s/^$1=//p" "$WORK/id_output"; }
+id_reject() {  # label, expected text, id_run args
+  local label="$1" text="$2"; shift 2
+  if id_run "$@"; then fail "accepted: $label"
+  elif grep -qF -- "$text" "$WORK/id.log"; then pass "rejected before any cluster access: $label"
+  else fail "rejected for another reason: $label"; cat "$WORK/id.log"; fi
+}
+base_common='deployment:
+  release: example-api
+image: { repository: ghcr.io/example-org/example-api }
+components:
+  web:
+    ports: { http: 8080 }'
+id_values "$base_common" $'deployment:\n  namespace: dev-somewhere-else\nconfig:\n  A: "1"'
+if id_run dev && [ "$(id_out namespace)/$(id_out release)/$(id_out bundle-secret)" = "dev-somewhere-else/example-api/" ]; then
+  pass "namespace and release are exactly the values' deployment.namespace / deployment.release (nothing derived from the repository name)"
+else
+  fail "identity from values"; cat "$WORK/id.log"
+fi
+first="$(cat "$WORK/id_output")"
+if id_run dev "" "" Other-Org/completely-different && [ "$(cat "$WORK/id_output")" = "$first" ] && ! grep -q 'GITHUB_REPOSITORY' <<<"$id_step"; then
+  pass "the same values give the same target from any repository: the identity step does not read the repository name"
+else
+  fail "the repository name influences the target"
+fi
+if [ "$(yq -o=json -I0 '.' "$idw/tmp/values/values.yaml")" = '{"image":{"repository":"ghcr.io/example-org/example-api"},"components":{"web":{"ports":{"http":8080}}}}' ] \
+   && [ "$(yq -o=json -I0 '.' "$idw/tmp/values/values-dev.yaml")" = '{"config":{"A":"1"}}' ]; then
+  pass "Helm receives copies of both values files without the deployment block and otherwise unchanged"
+else
+  fail "values copies for Helm"; cat "$idw/tmp/values/"*
+fi
+id_values "$base_common" $'deployment:\n  namespace: stage-somewhere\n' stage
+if id_run stage && [ "$(id_out namespace)" = "stage-somewhere" ]; then pass "stage: the namespace comes from values-stage.yaml"; else fail "stage namespace from values"; cat "$WORK/id.log"; fi
+id_values "$base_common" $'config:\n  A: "1"'
+id_reject "deployment.namespace missing" "deployment.namespace is not set in deploy/values.yaml or deploy/values-dev.yaml" dev
+if ! grep -q '^namespace=' "$WORK/id_output"; then pass "  ... and no namespace is guessed (no default, no runner namespace)"; else fail "a namespace was guessed"; fi
+id_values "$base_common" $'deployment:\n  namespace: arc-runners'
+id_reject "the runner's own namespace" "does not belong to the environment dev" dev
+id_values "$base_common" $'deployment:\n  namespace: stage-example-api'
+id_reject "a STAGE namespace in the DEV values (DEV/STAGE isolation)" "deployment.namespace 'stage-example-api' does not belong to the environment dev" dev
+id_values "$base_common" $'config: {}' stage
+printf 'deployment:\n  namespace: dev-example-api\n' >"$idw/deploy/values-dev.yaml"
+id_reject "values-stage.yaml without its own namespace (the DEV one is never reused)" "deployment.namespace is not set in deploy/values.yaml or deploy/values-stage.yaml" stage
+id_values "$base_common" $'deployment:\n  namespace: dev-'
+id_reject "the bare environment prefix" "is not a valid namespace name" dev
+id_values "$base_common" $'deployment:\n  namespace: Dev_Example'
+id_reject "an invalid namespace name" "is not a valid namespace name" dev
+id_values "$base_common" "deployment:
+  namespace: dev-$(printf 'x%.0s' $(seq 1 60))"
+id_reject "a namespace longer than 63 characters" "is not a valid namespace name" dev
+id_values "$base_common" $'deployment:\n  namespace: 5'
+id_reject "a namespace that is not a string" "deployment.namespace, deployment.release and deployment.envBundle.secret must be strings" dev
+id_values 'deployment: {}' $'deployment:\n  namespace: dev-example-api'
+id_reject "deployment.release missing" "deployment.release is not set" dev
+id_values $'deployment:\n  release: "x;id"' $'deployment:\n  namespace: dev-example-api'
+id_reject "a release with shell metacharacters" "deployment.release 'x;id' must match" dev
+id_values $'deployment:\n  release: example-api\n  kubeContext: other' $'deployment:\n  namespace: dev-example-api'
+id_reject "an unknown key under deployment" "deployment: unknown key(s) kubeContext" dev
+id_values $'deployment:\n  release: example-api\n  envBundle: { secret: app, extra: 1 }' $'deployment:\n  namespace: dev-example-api'
+id_reject "an unknown key under deployment.envBundle" "deployment.envBundle: unknown key(s) extra" dev
+id_values $'deployment: [1]' $'config: {}'
+id_reject "deployment that is not a map" "must be a map" dev
+id_values "$base_common" $'deployment:\n  namespace: dev-example-api'
+id_reject "a deprecated release input that contradicts the values" "input release 'other' contradicts deployment.release 'example-api'" dev other
+if id_run dev example-api && [ "$(id_out release)" = "example-api" ]; then pass "a deprecated release input equal to the values is accepted"; else fail "release input equal to values"; fi
+id_values $'deployment:\n  release: example-api\n  envBundle:\n    secret: app' $'deployment:\n  namespace: dev-example-api'
+if id_run dev && [ "$(id_out bundle-secret)" = "app" ]; then pass "the env-bundle target Secret is declared in the values (deployment.envBundle.secret)"; else fail "envBundle.secret from values"; fi
+id_reject "an env-bundle-secret input that contradicts the values" "contradicts deployment.envBundle.secret 'app'" dev "" other
+id_values "$base_common" $'deployment:\n  namespace: dev-example-api'
+if id_run dev "" app && [ "$(id_out bundle-secret)" = "app" ] && grep -q 'input env-bundle-secret is deprecated' "$WORK/id.log"; then
+  pass "the deprecated env-bundle-secret input still works when the values declare nothing (with a warning)"
+else fail "deprecated env-bundle-secret input"; fi
+id_values $'deployment:\n  release: example-api\n  envBundle:\n    secret: "app;x"' $'deployment:\n  namespace: dev-example-api'
+id_reject "an invalid env-bundle Secret name" "is not a Secret name of requiredSecrets" dev
+
+# the real consumers, when the workspace holds them: their namespaces and releases come from their own values
+if [ -d ../backend/deploy ] && [ -d ../lk-frontend/deploy ]; then
+  ws_id() {  # repository directory, environment -> "namespace release"
+    : >"$WORK/id_output"
+    ( cd "$1" && env -i PATH="$PATH" RUNNER_TEMP="$WORK/ws-id" GITHUB_OUTPUT="$WORK/id_output" ENVIRONMENT="$2" VALUES_DIR=deploy \
+        RELEASE_INPUT="" BUNDLE_SECRET_INPUT="" bash --noprofile --norc -c "$id_step" ) </dev/null >/dev/null 2>&1 || { echo error; return; }
+    echo "$(id_out namespace) $(id_out release)"
+  }
+  if [ "$(ws_id ../backend dev)" = "dev-lk-backend backend" ] && [ "$(ws_id ../lk-frontend dev)" = "dev-lk-backend lk-frontend" ] \
+     && [ "$(ws_id ../backend stage)" = "stage-lk-backend backend" ] && [ "$(ws_id ../lk-frontend stage)" = "stage-lk-backend lk-frontend" ]; then
+    pass "backend and lk-frontend declare the same namespace and two separate releases, in DEV and in STAGE"
+  else
+    fail "backend / lk-frontend identity: $(ws_id ../backend dev) | $(ws_id ../lk-frontend dev)"
+  fi
+fi
+
+echo "== deploy-k8s.yml and build-image.yml know no service"
+services='backend|lk-frontend|executor-frontend|landing|bcc-kommo-api|lk-backend'
+if grep -nE "(^|[^a-z-])($services)([^a-z-]|$)" "$dk" .github/workflows/build-image.yml | grep -v '^\S*:[0-9]*: *#' >"$WORK/names.log"; then
+  fail "a shared workflow names a service"; cat "$WORK/names.log"
+else
+  pass "no service name, namespace or release of a consumer appears in the logic of the shared workflows"
+fi
+kube_lines="$(yq '.jobs.deploy.steps[] | select(.run != null) | .run' "$dk" | grep -E '(^|[|(] *|; *|\$\( *)(kubectl|helm) ' | grep -vE 'curl|registry (login|logout)|helm pull|command -v|kubectl auth can-i "?(create|get|list|patch)"? (deployments|configmaps|jobs|secrets)' || true)"
+# shellcheck disable=SC2016  # literal workflow text
+missing_ns="$(grep -E '(kubectl|helm) ' <<<"$kube_lines" | grep -v -- '--namespace "${NAMESPACE}"' | grep -vE '^\s*(echo|#)|^\s*helm "\$\{args\[@\]\}"$' || true)"
+# shellcheck disable=SC2016  # literal workflow text
+if ! grep -q 'upgrade --install "${RELEASE}" "${CHART_DIR}" --namespace "${NAMESPACE}"' "$dk"; then missing_ns="${missing_ns} helm upgrade"; fi
+if [ -z "$missing_ns" ]; then
+  pass "every kubectl / helm command of the deploy job names --namespace \"\${NAMESPACE}\" explicitly"
+else
+  fail "kubectl / helm commands without the resolved namespace"; echo "$missing_ns"
+fi
+if grep -nE 'dry-run=client|arc-runners|current-context|config view' <<<"$(yq '.jobs[].steps[] | select(.run != null) | .run' "$dk" | grep -vE '^\s*#')"; then
+  fail "the deploy workflow relies on a client-side namespace default"
+else
+  pass "no client-side dry run, kubeconfig context or runner namespace is used to place an object"
+fi
+
 # Two releases in one namespace: no object of one release may carry the name of an object of the other.
 "$HELM" template backend "$CHART" --namespace dev-lk-backend -f tests/secrets/deploy/values.yaml -f tests/secrets/deploy/values-dev.yaml >"$WORK/shared-a.yaml"
 "$HELM" template lk-frontend "$CHART" --namespace dev-lk-backend -f tests/overrides/deploy/values.yaml -f tests/overrides/deploy/values-dev.yaml >"$WORK/shared-b.yaml"
@@ -325,6 +430,7 @@ if [ "$(grep -c -- '--selector "app.kubernetes.io/instance=${RELEASE}"' "$dk")" 
 else
   fail "rollout check / diagnostics are not limited to the release"
 fi
+rel=(dev refs/heads/dev-k8s/release push false "$good_digest")
 reject "app-secrets passed to a validation-only run" dev refs/heads/dev-k8s/feature-x push true "" "" deploy "" Akjet-dev/backend "" true
 reject "app-secrets passed to stage validation" stage refs/heads/stage-k8s/release push true "" "" deploy "" Akjet-dev/backend "" true
 accept "app-secrets passed to the deploying run" "deploy=true" "${rel[@]}" "" deploy "" Akjet-dev/backend "" true
@@ -361,12 +467,13 @@ if $tpl_ok; then pass "templates: every job calling deploy-k8s.yml grants conten
 echo "== build-image.yml: which branches may publish"
 names="$(yq '.jobs.build.steps[] | select(.id == "names") | .run' .github/workflows/build-image.yml)"
 publish_branches="$(yq '.env.PUBLISH_BRANCHES' .github/workflows/build-image.yml)"
-mkdir -p "$WORK/src" && : >"$WORK/src/Dockerfile"
-push_decision() {  # ref-name ref-type push-input
+mkdir -p "$WORK/src/deploy" && : >"$WORK/src/Dockerfile"
+printf 'image:\n  repository: ghcr.io/example-org/declared-image\n' >"$WORK/src/deploy/values.yaml"
+push_decision() {  # ref-name ref-type push-input [image input] [values-dir]
   : >"$WORK/gh_output"
   ( cd "$WORK/src" && env -i PATH="$PATH" GITHUB_OUTPUT="$WORK/gh_output" GITHUB_REPOSITORY="Example-Org/example-api" \
       GITHUB_REPOSITORY_OWNER="Example-Org" PUBLISH_BRANCHES="$publish_branches" GITHUB_REF_NAME="$1" GITHUB_REF_TYPE="$2" \
-      IMAGE_INPUT="" CONTEXT="." DOCKERFILE="Dockerfile" PLATFORM="linux/amd64" PUSH_INPUT="$3" SCAN_FAIL_ON="CRITICAL" \
+      IMAGE_INPUT="${4:-}" VALUES_DIR="${5:-deploy}" CONTEXT="." DOCKERFILE="Dockerfile" PLATFORM="linux/amd64" PUSH_INPUT="$3" SCAN_FAIL_ON="CRITICAL" \
       bash -c "$names" >"$WORK/names.log" 2>&1 ) || { echo error; return; }
   sed -n 's/^push=//p' "$WORK/gh_output"
 }
@@ -387,11 +494,28 @@ expect_push false stage-k8s/feature-example branch true
 expect_push false dev-k8s/release/nested branch true
 expect_push false dev-k8s-release branch true
 expect_push false dev-k8s/release tag true
-if out "image=ghcr.io/example-org/example-api" || { push_decision dev-k8s/release branch true >/dev/null; out "image=ghcr.io/example-org/example-api"; }; then
-  pass "image name is derived from the repository: ghcr.io/example-org/example-api"
+push_decision dev-k8s/release branch true >/dev/null
+if out "image=ghcr.io/example-org/declared-image"; then
+  pass "the image is image.repository of the service values (ghcr.io/example-org/declared-image), not the repository name"
 else
-  fail "image name"
+  fail "image from values"; cat "$WORK/names.log"
 fi
+if [ "$(push_decision dev-k8s/release branch true declared-image)" = "true" ] && out "image=ghcr.io/example-org/declared-image"; then
+  pass "a deprecated image input that names the same image is accepted"
+else fail "image input equal to values"; fi
+image_reject() {  # label, expected text, push_decision args
+  local label="$1" text="$2"; shift 2
+  if [ "$(push_decision "$@")" != "error" ]; then fail "accepted: $label"
+  elif grep -qF -- "$text" "$WORK/names.log"; then pass "rejected: $label"
+  else fail "rejected for another reason: $label"; cat "$WORK/names.log"; fi
+}
+image_reject "an image input that contradicts the values" "input image builds ghcr.io/example-org/example-api, but deploy/values.yaml deploys ghcr.io/example-org/declared-image" dev-k8s/release branch true example-api
+image_reject "no image anywhere (nothing is derived from the repository name)" "no image: set image.repository in nowhere/values.yaml" dev-k8s/release branch true "" nowhere
+printf 'image:\n  repository: ghcr.io/other-org/foreign\n' >"$WORK/src/deploy/values.yaml"
+image_reject "an image outside the owner's registry namespace" "must be a repository under ghcr.io/example-org/" dev-k8s/release branch true
+printf 'image:\n  repository: ghcr.io/example-org/declared-image:latest\n' >"$WORK/src/deploy/values.yaml"
+image_reject "an image repository with a tag" "lower case, no tag or digest" dev-k8s/release branch true
+printf 'image:\n  repository: ghcr.io/example-org/declared-image\n' >"$WORK/src/deploy/values.yaml"
 if [ "$(yq '.on.workflow_call.secrets | keys | join(",")' .github/workflows/build-image.yml)" = "build-secrets" ] \
    && [ "$(yq '.on.workflow_call.secrets.build-secrets.required' .github/workflows/build-image.yml)" = "false" ]; then
   pass "build-image.yml accepts one optional, explicitly passed secret and no runtime credentials"
@@ -577,8 +701,9 @@ uses_values="$(yq '[.jobs[].steps[] | select(.run != null) | .run | select(test(
 # shellcheck disable=SC2016  # literal shell text of the workflow
 uses_overrides="$(grep -c -- '-f "${RUNNER_TEMP}/overrides.json"' "$dk")"
 # shellcheck disable=SC2016
-if [ "$uses_overrides" = "3" ] && [ "$(grep -c -- '-f "${VALUES_DIR}/values.yaml" -f "${VALUES_DIR}/values-${ENVIRONMENT}.yaml"' "$dk")" = "3" ]; then
-  pass "validation render, migration render and helm upgrade all load values.yaml, values-<env>.yaml, then the overrides ($uses_values steps)"
+if [ "$uses_overrides" = "3" ] && [ "$(grep -c -- '-f "${values}/values.yaml" -f "${values}/values-${ENVIRONMENT}.yaml"' "$dk")" = "3" ] \
+   && [ "$(grep -c 'values="${RUNNER_TEMP}/values"' "$dk")" = "3" ]; then
+  pass "validation render, migration render and helm upgrade all load the values copies (without deployment), then the overrides ($uses_values steps)"
 else
   fail "overrides are not applied in every helm invocation ($uses_overrides of 3)"
 fi
@@ -1255,28 +1380,41 @@ else
 fi
 mig_step="$(yq '.jobs.deploy.steps[] | select(.name == "Run the migration Job") | .run' "$dk")"
 migbin="$WORK/migbin"; mkdir -p "$migbin"
+# The fake records the namespace of the request AND the one inside the object, the way the API compares them.
 cat >"$migbin/kubectl" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
+echo "kubectl $*" >>"$FAKE_STATE/mig-calls.log"
 case "$*" in
-  "create --dry-run=client -o json -f "*) yq -o=json '.' "${@: -1}" ;;
-  *" create -f -") cat >"$FAKE_STATE/job.json" ;;
-  *" create -f "*) yq -o=json '.' "${@: -1}" >"$FAKE_STATE/job.json" ;;
+  *"dry-run=client"*) echo "a client-side dry run would place the object in the runner namespace arc-runners" >&2; exit 3 ;;
+  "--namespace "*" create -f -")
+    doc="$(cat)"; req="$2"; obj="$(jq -r '.metadata.namespace // ""' <<<"$doc")"
+    if [ -n "$obj" ] && [ "$obj" != "$req" ]; then
+      echo "error: the namespace from the provided object \"$obj\" does not match the namespace \"$req\"" >&2; exit 1
+    fi
+    printf '%s' "$doc" >"$FAKE_STATE/job.json"; echo "$req" >"$FAKE_STATE/job.ns" ;;
   *" get job "*) printf '1/' ;;
   *" logs "*) echo "migrated" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 FAKE
 chmod +x "$migbin/kubectl"; ln -sf "$(command -v "$HELM")" "$migbin/helm"
-run_migration() {  # shadowed names
-  rm -f "$sec_state/job.json"; cp "$WORK/overrides.json" "$WORK/overrides.keep" 2>/dev/null || true; echo '{}' >"$WORK/overrides.json"
-  ( cd "$bn_src" && env -i PATH="$migbin:$PATH" HOME="$WORK" RUNNER_TEMP="$WORK" GITHUB_STEP_SUMMARY="$WORK/mig_summary" FAKE_STATE="$sec_state" \
-      GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RELEASE=example-api NAMESPACE=dev-example-api ENVIRONMENT=dev VALUES_DIR=deploy TIMEOUT=10s \
-      DIGEST="$good_digest" CHART_DIR="$OLDPWD/$CHART" SHADOWED="$1" bash --noprofile --norc -c "$mig_step" ) </dev/null >"$WORK/mig.log" 2>&1
+run_migration_in() {  # directory with deploy/, shadowed names, [namespace], [PATH prefix]
+  rm -f "$sec_state/job.json" "$sec_state/job.ns" "$sec_state/mig-calls.log"; echo '{}' >"$WORK/overrides.json"
+  mkdir -p "$WORK/values"
+  yq 'del(.deployment)' "$1/deploy/values.yaml" >"$WORK/values/values.yaml"; yq 'del(.deployment)' "$1/deploy/values-dev.yaml" >"$WORK/values/values-dev.yaml"
+  ( cd "$1" && env -i PATH="${4:-$migbin}:$PATH" HOME="$WORK" RUNNER_TEMP="$WORK" GITHUB_STEP_SUMMARY="$WORK/mig_summary" FAKE_STATE="$sec_state" \
+      GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RELEASE=example-api NAMESPACE="${3:-dev-example-api}" ENVIRONMENT=dev VALUES_DIR=deploy TIMEOUT=10s \
+      DIGEST="$good_digest" CHART_DIR="$OLDPWD/$CHART" SHADOWED="$2" bash --noprofile --norc -c "$mig_step" ) </dev/null >"$WORK/mig.log" 2>&1
 }
+run_migration() { run_migration_in "$bn_src" "$1"; }
 job_env() { jq -r '[.spec.template.spec.containers[0].env[] | .name + "=" + .value] | join(" ")' "$sec_state/job.json"; }
 if run_migration "" && [ "$(job_env)" = "APP_ENV=dev DB_HOST=db.default.example.test DB_PORT=5432 DB_USERNAME=example_migrator FEATURE_WRITES_ENABLED=false LOG_CHANNEL=stderr" ]; then
   pass "migration Job without a pass-through bundle: created exactly as rendered (other services are unaffected)"
+  if [ "$(cat "$sec_state/job.ns")" = "dev-example-api" ] && [ "$(jq -r '.metadata.namespace' "$sec_state/job.json")" = "dev-example-api" ] \
+     && ! grep -q 'dry-run' "$sec_state/mig-calls.log" && [ "$(grep -c -- '--namespace dev-example-api' "$sec_state/mig-calls.log")" = "$(wc -l <"$sec_state/mig-calls.log" | tr -d ' ')" ]; then
+    pass "the migration Job is created in the application namespace: the request and the object both say dev-example-api (the runner namespace is never involved)"
+  else fail "namespace of the migration Job"; cat "$sec_state/mig-calls.log"; fi
 else
   fail "migration Job without shadowed names: $(job_env 2>/dev/null)"; cat "$WORK/mig.log"
 fi
@@ -1297,12 +1435,6 @@ else
   fail "single-user plan: plan='$(pt_out plan)' shadowed='$(pt_out shadowed)'"; cat "$WORK/bn.log"
 fi
 one_shadowed="$(pt_out shadowed)"
-run_migration_in() {  # directory, shadowed names
-  rm -f "$sec_state/job.json"; echo '{}' >"$WORK/overrides.json"
-  ( cd "$1" && env -i PATH="$migbin:$PATH" HOME="$WORK" RUNNER_TEMP="$WORK" GITHUB_STEP_SUMMARY="$WORK/mig_summary" FAKE_STATE="$sec_state" \
-      GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RELEASE=example-api NAMESPACE=dev-example-api ENVIRONMENT=dev VALUES_DIR=deploy TIMEOUT=10s \
-      DIGEST="$good_digest" CHART_DIR="$OLDPWD/$CHART" SHADOWED="$2" bash --noprofile --norc -c "$mig_step" ) </dev/null >"$WORK/mig.log" 2>&1
-}
 if run_migration_in "$one" "$one_shadowed" && [ "$(job_env)" = "APP_ENV=dev DB_PORT=5432 LOG_CHANNEL=stderr" ] \
    && [ "$(jq -r '[.spec.template.spec.containers[0].envFrom[].secretRef.name] | join(",")' "$sec_state/job.json")" = "example-api-app" ]; then
   pass "single database user: the migration Job mounts only the application Secret and keeps no explicit DB_HOST / DB_USERNAME - it connects exactly as the application does"
@@ -1311,6 +1443,94 @@ else
 fi
 # shellcheck disable=SC2016  # a literal attempt at injection
 if run_migration 'DB_HOST;$(id)'; then fail "a malformed list of names was accepted by the migration step"; else pass "migration step refuses a malformed list of names"; fi
+if run_migration_in "$bn_src" "" dev-other-namespace && [ "$(cat "$sec_state/job.ns")" = "dev-other-namespace" ] && [ "$(jq -r '.metadata.namespace' "$sec_state/job.json")" = "dev-other-namespace" ]; then
+  pass "the migration Job follows the resolved namespace, whatever it is (no fixed or derived namespace)"
+else fail "migration Job in another resolved namespace"; cat "$WORK/mig.log"; fi
+# a chart that rendered the Job into another namespace: refused before anything is created
+fakehelm="$WORK/fakehelm"; mkdir -p "$fakehelm"; cp "$migbin/kubectl" "$fakehelm/kubectl"
+printf '#!/usr/bin/env bash
+printf "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: example-api-migrate-1-1\n  namespace: arc-runners\nspec: {template: {spec: {containers: [{name: m, image: x}]}}}\n"
+' >"$fakehelm/helm"; chmod +x "$fakehelm/helm"
+if run_migration_in "$bn_src" "" dev-example-api "$fakehelm"; then fail "a migration Job rendered for another namespace was created"
+elif grep -qF "the rendered migration object is 'Job example-api-migrate-1-1 arc-runners', expected Job example-api-migrate-1-1 in dev-example-api - nothing was created" "$WORK/mig.log" \
+     && ! grep -q ' create ' "$sec_state/mig-calls.log" 2>/dev/null; then
+  pass "a rendered Job that targets another namespace (e.g. arc-runners) is refused before the cluster is asked to create it"
+else fail "namespace mismatch of the rendered Job"; cat "$WORK/mig.log"; fi
+printf '#!/usr/bin/env bash
+printf "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: other\n"
+' >"$fakehelm/helm"
+if run_migration_in "$bn_src" "" dev-example-api "$fakehelm"; then fail "a non-Job migration object was created"
+elif grep -qF "expected Job example-api-migrate-1-1 in dev-example-api" "$WORK/mig.log"; then pass "an object other than the expected Job is refused"
+else fail "non-Job migration object"; cat "$WORK/mig.log"; fi
+
+echo "== deploy-k8s.yml: the deploy job re-reads the target and checks release ownership"
+prep_step="$(yq '.jobs.deploy.steps[] | select(.name == "Prepare values") | .run' "$dk")"
+prep() {  # directory, NAMESPACE, RELEASE
+  rm -rf "$WORK/prep"; mkdir -p "$WORK/prep"
+  ( cd "$1" && env -i PATH="$PATH" RUNNER_TEMP="$WORK/prep" ENVIRONMENT=dev VALUES_DIR=deploy NAMESPACE="$2" RELEASE="$3" \
+      bash --noprofile --norc -c "$prep_step" ) </dev/null >"$WORK/prep.log" 2>&1
+}
+id_values "$base_common" $'deployment:\n  namespace: dev-example-api\nconfig:\n  A: "1"'
+if prep "$idw" dev-example-api example-api && [ "$(yq -o=json -I0 '.' "$WORK/prep/values/values-dev.yaml")" = '{"config":{"A":"1"}}' ] \
+   && [ "$(yq '.deployment' "$WORK/prep/values/values.yaml")" = "null" ]; then
+  pass "deploy job: the same commit resolves to the same namespace and release; Helm gets the values without deployment"
+else fail "deploy job values preparation"; cat "$WORK/prep.log"; fi
+if prep "$idw" dev-other example-api; then fail "a namespace that differs from the validate job was accepted"
+elif grep -qF "the values resolve to 'dev-example-api example-api', the validate job resolved 'dev-other example-api'" "$WORK/prep.log"; then
+  pass "deploy job: a namespace different from the validate job stops the deployment before the first cluster request"
+else fail "namespace mismatch between the jobs"; cat "$WORK/prep.log"; fi
+if prep "$idw" "" ""; then fail "an empty target was accepted by the deploy job"; else pass "deploy job: an empty namespace / release is refused"; fi
+
+own_step="$(yq '.jobs.deploy.steps[] | select(.id == "owner") | .run' "$dk")"
+ownbin="$WORK/ownbin"; mkdir -p "$ownbin"
+cat >"$ownbin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+echo "kubectl $*" >>"$FAKE_LOG"
+case "$*" in
+  "--namespace "*" get configmaps -l owner=helm,name="*" -o json")
+    case "${FAKE_RECORDS:-}" in
+      forbidden) echo 'Error from server (Forbidden): configmaps is forbidden' >&2; exit 1 ;;
+      unreachable) echo 'Unable to connect to the server: EOF' >&2; exit 1 ;;
+      none) echo '{"items":[]}' ;;
+      unlabelled) echo '{"items":[{"metadata":{"labels":{"owner":"helm","name":"x","version":"1"}}}]}' ;;
+      *) jq -cn --arg v "$FAKE_RECORDS" '{items: [{metadata: {labels: {owner: "helm", version: "1", "akjet.kz/source-repository": $v}}}]}' ;;
+    esac ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+FAKE
+chmod +x "$ownbin/kubectl"
+own() {  # records, repository
+  : >"$WORK/own_output"; : >"$WORK/own-calls.log"
+  env -i PATH="$ownbin:$PATH" FAKE_LOG="$WORK/own-calls.log" FAKE_RECORDS="$1" GITHUB_OUTPUT="$WORK/own_output" GITHUB_REPOSITORY="$2" \
+    OWNER_LABEL="$(yq '.env.OWNER_LABEL' "$dk")" NAMESPACE=dev-shared RELEASE=backend bash --noprofile --norc -c "$own_step" </dev/null >"$WORK/own.log" 2>&1
+}
+if own none Akjet-dev/backend && [ "$(cat "$WORK/own_output")" = "label=akjet.kz/source-repository=Akjet-dev.backend" ] && grep -q -- '--namespace dev-shared' "$WORK/own-calls.log"; then
+  pass "a new release is assigned to the deploying repository (Helm release label akjet.kz/source-repository)"
+else fail "ownership of a new release"; cat "$WORK/own.log"; fi
+if own unlabelled Akjet-dev/backend && grep -q 'carries no owner label yet' "$WORK/own.log"; then
+  pass "a release installed by an earlier version (no label) is adopted by its next deployment"
+else fail "adoption of an unlabelled release"; fi
+if own Akjet-dev.backend Akjet-dev/backend; then pass "the owning repository deploys its release again"; else fail "the owner was refused"; cat "$WORK/own.log"; fi
+if own Akjet-dev.backend Akjet-dev/lk-frontend; then fail "another repository was allowed to take over a release"
+elif grep -qF "release backend in dev-shared belongs to Akjet-dev.backend, not to Akjet-dev/lk-frontend" "$WORK/own.log"; then
+  pass "shared namespace: a repository whose values name another service's release is stopped before any change"
+else fail "foreign release"; cat "$WORK/own.log"; fi
+if own forbidden Akjet-dev/backend; then fail "Forbidden was ignored"; elif grep -q 'may not list the Helm release records' "$WORK/own.log"; then pass "ownership: Forbidden is reported as a missing permission"; else fail "ownership Forbidden"; fi
+if own unreachable Akjet-dev/backend; then fail "an unreachable API was ignored"; elif grep -q 'the Kubernetes API did not answer' "$WORK/own.log"; then pass "ownership: an unreachable API is not treated as 'no release'"; else fail "ownership unreachable"; fi
+if own none "Example-Org/$(printf 'r%.0s' $(seq 1 70))" && grep -qE '^label=akjet.kz/source-repository=sha256-[0-9a-f]{40}$' "$WORK/own_output"; then
+  pass "a repository name too long for a label value is recorded as its hash"
+else fail "long repository name"; cat "$WORK/own_output"; fi
+# shellcheck disable=SC2016  # literal workflow text
+if [ "$(yq '.jobs.deploy.steps[] | select(.name == "Helm upgrade") | .env.OWNER_LABEL_VALUE' "$dk")" = '${{ steps.owner.outputs.label }}' ] \
+   && grep -qF -- '--labels "${OWNER_LABEL_VALUE}"' "$dk"; then
+  pass "helm upgrade records the owner on the release"
+else fail "owner label on helm upgrade"; fi
+steps_order="$(yq '[.jobs.deploy.steps[].name] | join("|")' "$dk")"
+case "$steps_order" in
+  *"Prepare values|"*"Check release ownership|"*"Provision application Secrets|Run the migration Job|Helm upgrade"*)
+    pass "order: values re-read, ownership checked, then Secrets, migration and upgrade" ;;
+  *) fail "order of the deploy steps: $steps_order" ;;
+esac
 
 echo "== consumers: every application repository against the candidate workflows"
 cc=(python3 tests/check_consumers.py)
@@ -1350,6 +1570,8 @@ for t in "${templates[@]}"; do
   sed -e 's#example-org/ci/#Akjet-dev/ci/#' -e "s#<CI_COMMIT>#$pin#" "$t" >"$syn/ws/example-api/.github/workflows/$(basename "$t")"
 done
 cp -R tests/secrets/deploy "$syn/ws/example-api/deploy"; printf 'FROM scratch\n' >"$syn/ws/example-api/Dockerfile"
+yq -i '.deployment.release = "example-api" | .image.repository = "ghcr.io/example-org/example-api"' "$syn/ws/example-api/deploy/values.yaml"
+for e in dev stage; do yq -i ".deployment.namespace = \"$e-example-api\"" "$syn/ws/example-api/deploy/values-$e.yaml"; done
 printf 'consumers:\n  - { name: example-api, repository: Example-Org/example-api, ref: dev-k8s/release, namespace: { dev: dev-example-api, stage: stage-example-api } }\n' >"$syn/manifest.yaml"
 syn_check() { "${cc[@]}" --manifest "$syn/manifest.yaml" --snapshots "$syn/snap" --workspace "$syn/ws" "$@" >"$WORK/syn.log" 2>&1; }
 if syn_check --write-snapshots --strict-sha && syn_check --fail-on-stale-snapshot; then
@@ -1399,10 +1621,32 @@ syn_defect "a call of a local workflow that is not reusable" "K7" k8s-build.yml 
 # shellcheck disable=SC2016  # literal GitHub expression inside a yq program
 syn_defect "a BuildKit secret passed that the Dockerfile never mounts" "passes secrets ['COMPOSER_AUTH'] that the Dockerfile never mounts" k8s-build.yml '.jobs.image.secrets."build-secrets" = "COMPOSER_AUTH=${{ secrets.X }}"'
 yq -i '.consumers[0].namespace.dev = "dev-other"' "$syn/manifest.yaml"
-if syn_check; then fail "not detected: namespace drift between the workflow and the platform"
-elif grep -qF "resolves dev to namespace dev-example-api, the platform expects dev-other" "$WORK/syn.log"; then pass "detected: the namespace the candidate resolves differs from what the platform provides"
+if syn_check; then fail "not detected: namespace drift between the values and the platform"
+elif grep -qF "values-dev.yaml targets namespace dev-example-api, the platform provides dev-other" "$WORK/syn.log"; then pass "detected: the namespace in the values differs from what the platform provides"
 else fail "namespace drift detected for another reason"; fi
 yq -i '.consumers[0].namespace.dev = "dev-example-api"' "$syn/manifest.yaml"
+syn_values_defect() {  # label, expected text, file under deploy/, yq edit
+  local label="$1" text="$2" file="$syn/ws/example-api/deploy/$3"
+  cp "$file" "$WORK/syn-backup.yml"; yq -i "$4" "$file"
+  if syn_check; then fail "not detected: $label"
+  elif grep -qF -- "$text" "$WORK/syn.log"; then pass "detected: $label"
+  else fail "detected for another reason: $label"; grep ERROR "$WORK/syn.log"; fi
+  cp "$WORK/syn-backup.yml" "$file"
+}
+syn_values_defect "a consumer without deployment.namespace" "deployment.namespace is not set" values-dev.yaml 'del(.deployment)'
+syn_values_defect "a consumer whose DEV values name a STAGE namespace" "does not belong to the environment dev" values-dev.yaml '.deployment.namespace = "stage-example-api"'
+syn_values_defect "a consumer without deployment.release" "deployment.release is not set" values.yaml 'del(.deployment.release)'
+syn_values_defect "a consumer without image.repository" "K12 example-api: image.repository" values.yaml 'del(.image.repository)'
+syn_values_defect "an image outside the owner's registry namespace" "must name an image under ghcr.io/example-org/" values.yaml '.image.repository = "docker.io/library/nginx"'
+printf 'consumers:\n  - { name: example-api, repository: Example-Org/example-api, ref: dev-k8s/release, namespace: { dev: dev-example-api, stage: stage-example-api } }\n  - { name: example-two, repository: Example-Org/example-two, ref: dev-k8s/release, namespace: { dev: dev-example-api, stage: stage-example-api } }\n' >"$syn/manifest.yaml"
+cp -R "$syn/ws/example-api" "$syn/ws/example-two"; yq -i '.image.repository = "ghcr.io/example-org/example-two"' "$syn/ws/example-two/deploy/values.yaml"
+if syn_check --write-snapshots; then fail "two services with the same release in one namespace were accepted"
+elif grep -qF "K11 dev namespace dev-example-api: example-api=example-api, example-two=example-api" "$WORK/syn.log"; then pass "detected: two services that share a namespace but declare the same release"
+else fail "shared namespace / same release"; grep ERROR "$WORK/syn.log"; fi
+yq -i '.deployment.release = "example-two"' "$syn/ws/example-two/deploy/values.yaml"
+if syn_check --write-snapshots; then pass "two services in one namespace with their own releases are accepted (backend + lk-frontend model)"; else fail "shared namespace, separate releases"; grep ERROR "$WORK/syn.log"; fi
+rm -rf "$syn/ws/example-two" "$syn/snap/example-two.json"
+printf 'consumers:\n  - { name: example-api, repository: Example-Org/example-api, ref: dev-k8s/release, namespace: { dev: dev-example-api, stage: stage-example-api } }\n' >"$syn/manifest.yaml"
 sed -i.bak "s#$pin#0000000000000000000000000000000000000000#" "$syn/ws/example-api/.github/workflows/k8s-deploy.yml"
 if syn_check && grep -q 'PENDING' "$WORK/syn.log" && ! syn_check --strict-sha && grep -q 'K10 consumers pin different revisions\|all-zero placeholder' "$WORK/syn.log"; then
   pass "the zero placeholder and mixed revisions are reported, and refused in strict mode"

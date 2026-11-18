@@ -12,9 +12,15 @@ on:
   workflow_call:
     inputs:
       image:
-        description: Image name under ghcr.io/<owner>/ (default - the repository name)
+        description: >-
+          Deprecated - the image is declared in the values (image.repository of <values-dir>/values.yaml).
+          When set: the image name under ghcr.io/<owner>/; it must then agree with the values.
         type: string
         default: ''
+      values-dir:
+        description: Directory with values.yaml; its image.repository names the image that is built and published
+        type: string
+        default: 'deploy'
       context:
         description: Build context, relative to the repository root
         type: string
@@ -113,6 +119,7 @@ jobs:
         id: names
         env:
           IMAGE_INPUT: ${{ inputs.image }}
+          VALUES_DIR: ${{ inputs.values-dir }}
           CONTEXT: ${{ inputs.context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           PLATFORM: ${{ inputs.platform }}
@@ -121,9 +128,28 @@ jobs:
         run: |
           set -euo pipefail
           owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          name="${IMAGE_INPUT:-${GITHUB_REPOSITORY#*/}}"
-          if ! printf '%s' "${name}" | grep -Eq '^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$'; then
-            echo "::error::image name must match ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?\$"; exit 1
+          # The image is the one the service deploys: image.repository of its values. Nothing is derived
+          # from the repository name. The deprecated input may only confirm it.
+          case "${VALUES_DIR}" in /*|*..*) echo "::error::values-dir must be a relative path inside the repository"; exit 1 ;; esac
+          declared=""
+          if [ -f "${VALUES_DIR}/values.yaml" ]; then
+            declared="$(yq '.image.repository // ""' "${VALUES_DIR}/values.yaml")"
+          fi
+          if [ -n "${IMAGE_INPUT}" ]; then
+            if ! printf '%s' "${IMAGE_INPUT}" | grep -Eq '^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$'; then
+              echo "::error::image name must match ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?\$"; exit 1
+            fi
+            image="ghcr.io/${owner}/${IMAGE_INPUT}"
+            if [ -n "${declared}" ] && [ "${declared}" != "${image}" ]; then
+              echo "::error::input image builds ${image}, but ${VALUES_DIR}/values.yaml deploys ${declared}"; exit 1
+            fi
+          elif [ -n "${declared}" ]; then
+            image="${declared}"
+          else
+            echo "::error::no image: set image.repository in ${VALUES_DIR}/values.yaml"; exit 1
+          fi
+          if ! printf '%s' "${image}" | grep -Eq "^ghcr\.io/${owner}/[a-z0-9]([a-z0-9._/-]*[a-z0-9])?\$"; then
+            echo "::error::image ${image} must be a repository under ghcr.io/${owner}/ (lower case, no tag or digest)"; exit 1
           fi
           for path in "${CONTEXT}" "${DOCKERFILE}"; do
             case "${path}" in
@@ -147,9 +173,10 @@ jobs:
             echo "::notice::${GITHUB_REF_NAME} is not a publishing branch (${PUBLISH_BRANCHES}): the image is built and scanned, not pushed"
           fi
           {
-            echo "image=ghcr.io/${owner}/${name}"
+            echo "image=${image}"
             echo "push=${push}"
           } >> "${GITHUB_OUTPUT}"
+          echo "Image: ${image} (push: ${push})"
 
       - name: Log in to GHCR
         if: steps.names.outputs.push == 'true'
