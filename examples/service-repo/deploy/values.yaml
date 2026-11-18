@@ -1,0 +1,23 @@
+# Example values of a service (shared chart akjet-app). Everything about WHAT is deployed and WHERE lives in
+# the service repository; Akjet-dev/ci knows no service. Contract: docs/workflows.md, "Контракт values".
+deployment:
+  release: example-api          # Helm release; objects and Secrets are named example-api-...
+  # envBundle:
+  #   secret: app               # optional: env-bundle goes, key by key, into Secret example-api-app
+image:
+  repository: ghcr.io/example-org/example-api   # built AND deployed; the digest comes from the build
+imagePullSecrets: [registry-pull]
+config:
+  LOG_CHANNEL: stderr
+# requiredSecrets:
+#   app: [APP_KEY]
+# envFromSecrets: [app]
+components:
+  web:
+    ports: { http: 8080 }
+    service: { enabled: true }
+    probes:
+      readiness: { path: /healthz, port: http }
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 200m, memory: 128Mi }

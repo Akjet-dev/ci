@@ -1,4 +1,23 @@
 {
+ "values": {
+  "deployment": {
+   "dev": {
+    "envBundle": {
+     "secret": "app"
+    },
+    "namespace": "dev-lk-backend",
+    "release": "backend"
+   },
+   "stage": {
+    "envBundle": {
+     "secret": "app"
+    },
+    "namespace": "stage-lk-backend",
+    "release": "backend"
+   }
+  },
+  "image": "ghcr.io/akjet-dev/backend"
+ },
  "workflows": {
   "k8s-build.yml": {
    "calls": [
@@ -10,7 +29,7 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "842573924b7f95d568c6393fd3e3dc45252932c3",
+     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
      "secrets": {},
      "uses": "deploy-k8s.yml",
      "with": {
@@ -29,7 +48,7 @@
       "contents": "read",
       "packages": "write"
      },
-     "ref": "842573924b7f95d568c6393fd3e3dc45252932c3",
+     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
      "secrets": {
       "build-secrets": "COMPOSER_AUTH={\"http-basic\":{\"nova.laravel.com\":{\"username\":\"${{ secrets.NOVA_USERNAME }}\",\"password\":\"${{ secrets.NOVA_LICENSE_KEY }}\"}}}\n"
      },
@@ -69,14 +88,13 @@
       "contents": "read",
       "packages": "read"
      },
-     "ref": "842573924b7f95d568c6393fd3e3dc45252932c3",
+     "ref": "8f4d8a16a3a6f741fb94ef904f4ccca43980afa3",
      "secrets": {
       "env-bundle": "${{ secrets.DEV_BACKEND_ENV }}"
      },
      "uses": "deploy-k8s.yml",
      "with": {
       "chart-version": "0.1.0",
-      "env-bundle-secret": "app",
       "environment": "dev",
       "image-digest": "${{ inputs.digest }}",
       "restart": "${{ inputs.restart }}",

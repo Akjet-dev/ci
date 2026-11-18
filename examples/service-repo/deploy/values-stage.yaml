@@ -1,0 +1,5 @@
+deployment:
+  namespace: stage-example-api     # the STAGE namespace the platform provides
+components:
+  web:
+    replicas: 1

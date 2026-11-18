@@ -6,9 +6,8 @@
 #   env-bundle.sh check    <environment> <bundle.json> [values-dir]   validate; prints NAMES only, never values
 #   env-bundle.sh template <environment> [values-dir]                 print a bundle skeleton (empty values)
 #
-# Pass-through services (input env-bundle-secret of deploy-k8s.yml): the Secret name is read from the caller
-# workflows of the current repository (.github/workflows/*.yml); ENV_BUNDLE_SECRET=<name> overrides it,
-# ENV_BUNDLE_SECRET= (empty) forces the declared mode.
+# Pass-through services: the Secret name is deployment.envBundle.secret of the values;
+# ENV_BUNDLE_SECRET=<name> overrides it, ENV_BUNDLE_SECRET= (empty) forces the declared mode.
 # <environment>: any environment that has <values-dir>/values-<environment>.yaml (dev, stage, ...).
 # [values-dir]:  default ./deploy (run from the service repository).
 # Needs: bash, yq (mikefarah v4), jq. Nothing is sent anywhere and nothing is written next to the bundle.
@@ -21,10 +20,15 @@ command="$1"; environment="$2"
 for tool in yq jq; do command -v "${tool}" >/dev/null || { echo "${tool} is required" >&2; exit 2; }; done
 step="$(yq '.jobs.validate.steps[] | select(.id == "bundle") | .run' "${workflow}")"
 [ -n "${step}" ] || { echo "step 'bundle' not found in ${workflow}" >&2; exit 2; }
+# The target Secret of a pass-through bundle is declared in the values (deployment.envBundle.secret), as in
+# the workflow. ENV_BUNDLE_SECRET=<name> overrides it; ENV_BUNDLE_SECRET= (empty) forces the declared mode.
 if [ -n "${ENV_BUNDLE_SECRET+set}" ]; then
   bundle_secret="${ENV_BUNDLE_SECRET}"
 else
-  bundle_secret="$(cat .github/workflows/*.yml 2>/dev/null | grep -E '^[[:space:]]*env-bundle-secret:' | head -1 | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*(#.*)?$//' | tr -d "\"'" || true)"
+  values_dir="${4:-deploy}"; [ "${command}" = "template" ] && values_dir="${3:-deploy}"
+  files=("${values_dir}/values.yaml"); [ -f "${values_dir}/values-${environment}.yaml" ] && files+=("${values_dir}/values-${environment}.yaml")
+  # shellcheck disable=SC2016  # yq program, not shell
+  bundle_secret="$(yq ea '. as $d ireduce ({}; . * $d) | .deployment.envBundle.secret // ""' "${files[@]}" 2>/dev/null || true)"
 fi
 [ -z "${bundle_secret}" ] || echo "pass-through mode: every key goes to Secret '${bundle_secret}' (env-bundle-secret)" >&2
 work="$(mktemp -d "${TMPDIR:-/tmp}/env-bundle.XXXXXX")"; trap 'rm -rf "${work:?}"' EXIT

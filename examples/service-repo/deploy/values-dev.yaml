@@ -1,0 +1,5 @@
+deployment:
+  namespace: dev-example-api       # the DEV namespace the platform provides
+components:
+  web:
+    replicas: 1
