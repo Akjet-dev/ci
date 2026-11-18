@@ -277,15 +277,17 @@ jobs:
           namespace="$(field namespace)"; release="$(field release)"; bundle_secret="$(field envBundle.secret)"
 
           [ -n "${namespace}" ] || die "deployment.namespace is not set in ${common} or ${envfile}: the target namespace comes only from the values of the service"
-          printf '%s' "${namespace}" | grep -Eq "${label}" && [ "${#namespace}" -le 63 ] \
-            || die "deployment.namespace '${namespace}' is not a valid namespace name (lower case letters, digits, '-'; at most 63 characters)"
+          if ! printf '%s' "${namespace}" | grep -Eq "${label}" || [ "${#namespace}" -gt 63 ]; then
+            die "deployment.namespace '${namespace}' is not a valid namespace name (lower case letters, digits, '-'; at most 63 characters)"
+          fi
           case "${namespace}" in
             "${ENVIRONMENT}"-?*) ;;
             *) die "deployment.namespace '${namespace}' does not belong to the environment ${ENVIRONMENT}: namespaces of ${ENVIRONMENT} start with '${ENVIRONMENT}-' (check ${envfile})" ;;
           esac
           [ -n "${release}" ] || die "deployment.release is not set in ${common} or ${envfile}"
-          printf '%s' "${release}" | grep -Eq "${label}" && [ "${#release}" -le 40 ] \
-            || die "deployment.release '${release}' must match ${label} and have at most 40 characters"
+          if ! printf '%s' "${release}" | grep -Eq "${label}" || [ "${#release}" -gt 40 ]; then
+            die "deployment.release '${release}' must match ${label} and have at most 40 characters"
+          fi
           if [ -n "${RELEASE_INPUT}" ] && [ "${RELEASE_INPUT}" != "${release}" ]; then
             die "input release '${RELEASE_INPUT}' contradicts deployment.release '${release}' of the values (the input is deprecated - remove it)"
           fi
@@ -757,8 +759,9 @@ jobs:
           for f in "${common}" "${envfile}"; do test -f "${f}" || { echo "::error::values file not found: ${f}"; exit 1; }; done
           # shellcheck disable=SC2016  # yq program, not shell
           got="$(yq ea '. as $doc ireduce ({}; . * $doc) | (.deployment.namespace // "") + " " + (.deployment.release // "")' "${common}" "${envfile}")"
-          [ -n "${NAMESPACE}" ] && [ -n "${RELEASE}" ] && [ "${got}" = "${NAMESPACE} ${RELEASE}" ] \
-            || { echo "::error::the values resolve to '${got}', the validate job resolved '${NAMESPACE} ${RELEASE}' - nothing was changed"; exit 1; }
+          if [ -z "${NAMESPACE}" ] || [ -z "${RELEASE}" ] || [ "${got}" != "${NAMESPACE} ${RELEASE}" ]; then
+            echo "::error::the values resolve to '${got}', the validate job resolved '${NAMESPACE} ${RELEASE}' - nothing was changed"; exit 1
+          fi
           mkdir -p "${RUNNER_TEMP}/values"
           yq 'del(.deployment)' "${common}" > "${RUNNER_TEMP}/values/values.yaml"
           yq 'del(.deployment)' "${envfile}" > "${RUNNER_TEMP}/values/values-${ENVIRONMENT}.yaml"
